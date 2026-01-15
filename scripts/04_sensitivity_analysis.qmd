@@ -1,0 +1,95 @@
+---
+title: "Exposome AIRWAYS Analysis"
+subtitle: "Sensitivity Differential Abundance Analysis"
+author: "Jason Laird"
+date: today 
+date-format: short
+engine: knitr
+execute: 
+  warning: false
+  message: false
+  cache: true
+format: 
+  html:
+    code-fold: true
+    theme: 
+      - simplex
+      - custom.scss
+    fontcolor: '#0c051a'
+---
+
+## Setup
+
+### Load Libraries
+
+```{r}
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(janitor)
+library(ggpubr)
+library(tidyexposomics)
+library(MultiAssayExperiment)
+```
+
+### Load Data
+
+```{r}
+# Codebook
+aw_cb <- readRDS("../results/input_data/aw_cb.rds")
+
+# MultiAssayExperiment Object
+fev1_fvc_expom <- readRDS("../results/deg/fev1_fvc_expom.rds")
+
+# Exposure variables
+exp_vars <- readRDS("../results/qc/exp_vars.rds")
+num_exp_vars <- readRDS("../results/qc/num_exp_vars.rds")
+
+# All variables
+vars <- aw_cb$variable |> 
+  (\(chr)chr[chr %in% colnames(colData(fev1_fvc_expom))])()
+```
+
+## Sensitivity Analysis
+
+### FEV1/FVC
+
+```{r}
+# Perform Sensitivity Analysis
+fev1_fvc_expom <- fev1_fvc_expom |>
+    run_sensitivity_analysis(
+        base_formula = ~ pftprefev1fvc_zscore + age + gli_sex + income5,
+        methods = c("limma_trend"),
+        scaling_methods = c("none"),
+        covariates_to_remove = c(
+            "age",
+            "gli_sex",
+            "income5"
+        ),
+        pval_col = "P.Value",
+        logfc_col = "logFC",
+        logFC_threshold = log2(1),
+        pval_threshold = 0.05,
+        stability_metric = "stability_score",
+        bootstrap_n = 100,
+        action = "add"
+    )
+```
+
+
+## Summary
+
+-   
+
+## Save Data
+
+```{r}
+# Save MultiAssayExperiment Objects
+```
+
+## Session Info
+
+```{r}
+sessionInfo()
+```

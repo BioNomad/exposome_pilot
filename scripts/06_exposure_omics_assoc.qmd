@@ -1,0 +1,954 @@
+---
+title: "Exposome AIRWAYS Analysis"
+subtitle: "Multiomics Integration"
+author: "Jason Laird"
+date: today 
+date-format: short
+engine: knitr
+execute: 
+  warning: false
+  message: false
+  cache: true
+format: 
+  html:
+    code-fold: true
+    theme: 
+      - simplex
+      - custom.scss
+    fontcolor: '#0c051a'
+---
+
+## Setup
+
+### Load Libraries
+
+```{r}
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(janitor)
+library(ggpubr)
+library(tidyexposomics)
+library(MultiAssayExperiment)
+library(patchwork)
+library(ggsci)
+```
+
+### Load Data
+
+```{r}
+# Codebook
+aw_cb <- readRDS("../results/input_data/aw_cb.rds")
+
+# MultiAssayExperiment Object
+fev1_fvc_expom <- readRDS("../results/integration/fev1_fvc_expom.rds")
+
+# Variable Map
+fev1_fvc_expom_var_map <- readRDS(
+  "../results/integration/fev1_fvc_expom_var_map.rds")
+
+# Exposure variables
+exp_vars <- readRDS("../results/qc/exp_vars.rds")
+num_exp_vars <- readRDS("../results/qc/num_exp_vars.rds")
+
+# All variables
+vars <- aw_cb$variable |> 
+  (\(chr)chr[chr %in% colnames(colData(fev1_fvc_expom))])()
+
+```
+
+## Exposure-Omics Association
+
+### DEG Exposure Association
+
+```{r}
+#| fig-width: 12
+#| fig-height: 13
+
+# Correlate degs with exposures
+fev1_fvc_expom_degs <- fev1_fvc_expom |>
+    # Perform correlation analysis between degs
+    # and exposures
+    run_correlation(
+        feature_type = "degs",
+        robust = F,
+        deg_pval_col = "P.Value",
+        deg_pval_thresh = 0.05,
+        deg_logfc_thresh = log2(1),
+        deg_logfc_col = "logFC",
+        exposure_cols = num_exp_vars,
+        action = "add",
+        correlation_cutoff = 0.3,
+        pval_cutoff = 0.05,
+        cor_pval_column = "p.value"
+    ) |>
+    # Perform correlation analysis between factor features
+    run_correlation(
+        feature_type = "degs",
+        robust = F,
+        deg_pval_col = "P.Value",
+        deg_pval_thresh = 0.05,
+        deg_logfc_thresh = log2(1),
+        deg_logfc_col = "logFC",
+        feature_cors = TRUE,
+        action = "add",
+        correlation_cutoff = 0.3,
+        pval_cutoff = 0.05,
+        cor_pval_column = "p.value"
+    )
+
+fev1_fvc_expom_degs |>
+    plot_correlation_summary(
+        mode = "summary",
+        feature_type = "degs"
+    ) &
+  plot_layout(heights = c(5,2))
+```
+
+#### Proportion of Assay Correlations per Exposure Category
+
+```{r}
+#| fig-width: 6
+#| fig-height: 4
+fev1_fvc_expom_degs@metadata[["correlation"]][["degs"]] |> 
+  tabyl(category, exp_name) |> 
+  pivot_longer(-category,
+               names_to = "exp_name", 
+               values_to = "count") |> 
+  ggplot(aes(x = category,
+             y = count,
+             fill = exp_name)) +
+  geom_bar(stat = "identity", 
+           position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "",
+    y = "Proportion",
+    fill = "Exposure",
+    title = "Proportion of Omics type by Exposure Category"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  scale_fill_npg()
+```
+
+
+#### Exposure Associations Normalized to # of Exposures
+
+```{r}
+#| fig-height: 3
+#| fig-width: 6
+fev1_fvc_expom_degs@metadata$correlation$degs |>
+  group_by(category) |> 
+  reframe(
+    n=n(),
+    unique_vars=length(unique(exposure)),
+    prop=n/unique_vars
+  ) |> 
+  filter(unique_vars>1) |> 
+  ggplot(aes(x = prop, 
+             y = reorder(category,prop),
+             fill = category)) +
+     geom_col(color="black",linewidth=0.005) +
+     labs(
+       x = "No. of Assocations/No. Unique Variables",
+       y = "",
+       title = "Exposure Associations",
+       subtitle = "Normalized to No. of Exposures"
+     ) +
+     theme_classic()+
+  scale_fill_npg()+
+  theme(legend.position = "none")
+  
+  
+```
+
+
+#### Number of Shared Features
+
+#### Fix for Circos
+
+```{r}
+trace(plot_circos_correlation,edit=T)
+#log10(edge_weight+10)
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+fev1_fvc_expom_degs |>
+    plot_circos_correlation(
+        feature_type = "degs",
+        shared_cutoff = 10,
+        low = "blue4",
+        mid="white",
+        high = "red4",
+        midpoint = 50
+    )
+```
+
+#### Network Creation
+
+#### Fix Network Creation 
+
+```{r}
+
+trace(run_create_network,edit=TRUE)
+# Insert this fix:
+ feature_type <- match.arg(feature_type)
+  action <- match.arg(action)
+
+  all_metadata <- MultiAssayExperiment::metadata(expomicset)
+  cor_data <- all_metadata$correlation[[feature_type]]
+
+  if (is.null(cor_data)) {
+    stop(sprintf("No correlation data found for feature_type = '%s'", feature_type))
+  }
+
+  message("Creating network from correlation results.")
+
+  # --- case 1: exposure-feature correlations
+  if (all(c("feature", "exposure", "exp_name", "category") %in% colnames(cor_data))) {
+
+    node_tbl <- dplyr::distinct(
+      dplyr::bind_rows(
+        dplyr::select(cor_data, name = feature, group = exp_name),
+        dplyr::select(cor_data, name = exposure, group = category)
+      )
+    ) |>
+      dplyr::mutate(vertex_id = paste(name, group, sep = "_"))
+
+    edge_df <- cor_data |>
+      dplyr::mutate(
+        from = paste(exposure, category, sep = "_"),
+        to   = paste(feature, exp_name, sep = "_")
+      ) |>
+      dplyr::select(from, to, correlation, FDR)
+
+  # --- case 2: generic pairwise with var1/var2
+  } else if (all(c("var1", "var2", "var1_type", "var2_type") %in% colnames(cor_data))) {
+
+    node_tbl <- dplyr::distinct(
+      dplyr::bind_rows(
+        dplyr::select(cor_data, name = var1, group = var1_type),
+        dplyr::select(cor_data, name = var2, group = var2_type)
+      )
+    ) |>
+      dplyr::mutate(vertex_id = paste(name, group, sep = "_"))
+
+    edge_df <- cor_data |>
+      dplyr::mutate(
+        from = paste(var1, var1_type, sep = "_"),
+        to   = paste(var2, var2_type, sep = "_")
+      ) |>
+      dplyr::select(from, to, correlation, FDR)
+
+  # --- case 3: correlations across experiments
+  } else if (all(c("var1", "var2", "exp_name_1", "exp_name_2") %in% colnames(cor_data))) {
+
+    node_tbl <- dplyr::distinct(
+      dplyr::bind_rows(
+        dplyr::select(cor_data, name = var1, group = exp_name_1),
+        dplyr::select(cor_data, name = var2, group = exp_name_2)
+      )
+    ) |>
+      dplyr::mutate(vertex_id = paste(name, group, sep = "_"))
+
+    edge_df <- cor_data |>
+      dplyr::mutate(
+        from = paste(var1, exp_name_1, sep = "_"),
+        to   = paste(var2, exp_name_2, sep = "_")
+      ) |>
+      dplyr::select(from, to, correlation, FDR)
+
+  } else {
+    stop("Unrecognized correlation format.")
+  }
+
+  # --- build graph safely with unique vertex_id ---
+  vertices <- node_tbl |>
+    dplyr::transmute(
+      name = vertex_id,   # unique ID for igraph
+      label = name,       # original biological name
+      group = group       # grouping info
+    )
+
+  g <- igraph::graph_from_data_frame(
+    edge_df,
+    directed = FALSE,
+    vertices = vertices
+  )
+
+  net_summary <- .summarize_graph(g)
+  net_name <- paste0("network_", feature_type)
+
+  if (action == "add") {
+    MultiAssayExperiment::metadata(expomicset)[["network"]][[net_name]] <- list(
+      graph = g,
+      summary = net_summary
+    )
+    step_record <- list(run_create_network = list(
+      timestamp = Sys.time(),
+      params = list(feature_type = feature_type),
+      notes = paste0("Created undirected network from correlation results for '",
+                     feature_type, "'.")
+    ))
+    MultiAssayExperiment::metadata(expomicset)$summary$steps <-
+      c(MultiAssayExperiment::metadata(expomicset)$summary$steps, step_record)
+
+    message("Network added to metadata as: ", net_name)
+    return(expomicset)
+
+  } else {
+    return(list(graph = g, summary = net_summary))
+  }
+
+```
+
+
+```{r}
+fev1_fvc_expom_degs <- fev1_fvc_expom_degs |>
+    run_create_network(
+        feature_type = "degs_feature_cor",
+        action = "add"
+    ) |>
+    run_create_network(
+        feature_type = "degs",
+        action = "add"
+    )
+```
+
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+fev1_fvc_expom_degs |>
+    plot_network(
+        network = "degs",
+        top_n_nodes = 100,
+        include_stats = TRUE,
+        cor_thresh = 0.3,
+        node_color_var = "group",
+        label = TRUE,
+        label_top_n = 10
+    )
+
+```
+
+
+#### Fix Exposure Impact
+
+```{r}
+
+trace(run_exposure_impact,edit = TRUE)
+.check_suggested(pkg = "tidygraph")
+
+  feature_type <- match.arg(feature_type)
+  action <- match.arg(action)
+
+  md <- MultiAssayExperiment::metadata(expomicset)
+
+  # --- checks -----------------------------------------------------------------
+  if (is.null(md$correlation[[feature_type]])) {
+    stop("Correlation results missing for feature_type = ", feature_type,
+         ". Please run run_correlation(..., feature_type = '", feature_type, "').")
+  }
+
+  # prefer "..._feature_cor" but fall back to plain "network_<feature_type>"
+  graph_key <- paste0("network_", feature_type, "_feature_cor")
+  if (is.null(md$network[[graph_key]])) {
+    fallback_key <- paste0("network_", feature_type)
+    if (!is.null(md$network[[fallback_key]])) {
+      graph_key <- fallback_key
+    } else {
+      stop("Network missing for feature_type = ", feature_type,
+           ". Please run run_create_network(..., feature_type = '", feature_type, "').")
+    }
+  }
+
+  correlation_df <- md$correlation[[feature_type]]
+  net_graph      <- md$network[[graph_key]]$graph
+
+  # Optional p-val filter if column exists
+  if (!is.null(pval_col) && pval_col %in% names(correlation_df)) {
+    correlation_df <- dplyr::filter(correlation_df, .data[[pval_col]] <= pval_thresh)
+  }
+
+  # --- centralities from graph -------------------------------------------------
+  node_centrality <- tidygraph::as_tbl_graph(net_graph) |>
+    tidygraph::activate(nodes) |>
+    dplyr::mutate(
+      centrality_degree      = tidygraph::centrality_degree(),
+      centrality_eigen       = tidygraph::centrality_eigen(),
+      centrality_closeness   = tidygraph::centrality_closeness(),
+      centrality_betweenness = tidygraph::centrality_betweenness()
+    ) |>
+    tibble::as_tibble()
+  # node_centrality has columns:
+  #   - name  (vertex_id used internally by igraph)
+  #   - label (original biological name)
+  #   - group (exp_name/category/type)
+  #   - centrality_* (computed above)
+
+  # --- construct join keys that mirror create_network() ------------------------
+  # Case A: exposure-feature schema: feature, exposure, exp_name, category
+  if (all(c("feature", "exposure", "exp_name", "category") %in% names(correlation_df))) {
+
+    df <- correlation_df |>
+      dplyr::mutate(
+        feature_vertex_id  = paste(.data$feature,  .data$exp_name, sep = "_"),
+        exposure_vertex_id = paste(.data$exposure, .data$category, sep = "_")
+      )
+
+    exposure_col <- "exposure"
+
+  # Case B: generic var1/var2 with explicit types (expect var1 == exposure)
+  } else if (all(c("var1", "var2", "var1_type", "var2_type") %in% names(correlation_df))) {
+
+    df <- correlation_df |>
+      dplyr::filter(.data$var1_type == "exposure", .data$var2_type != "exposure") |>
+      dplyr::mutate(
+        exposure            = .data$var1,
+        feature             = .data$var2,
+        feature_vertex_id   = paste(.data$var2, .data$var2_type, sep = "_"),
+        exposure_vertex_id  = paste(.data$var1, .data$var1_type, sep = "_")
+      )
+
+    exposure_col <- "exposure"
+
+  # Case C: cross-experiment pairings (use exp_name_1/exp_name_2 as groups)
+  } else if (all(c("var1", "var2", "exp_name_1", "exp_name_2") %in% names(correlation_df))) {
+
+    df <- correlation_df |>
+      dplyr::mutate(
+        # Naming here keeps "exposure" just as a grouping label for summary;
+        # adapt as needed for your schema.
+        exposure            = .data$var1,
+        feature             = .data$var2,
+        feature_vertex_id   = paste(.data$var2, .data$exp_name_2, sep = "_"),
+        exposure_vertex_id  = paste(.data$var1, .data$exp_name_1, sep = "_")
+      )
+
+    exposure_col <- "exposure"
+
+  } else {
+    stop("Unrecognized correlation format: cannot construct vertex ids to match the graph.")
+  }
+
+  # --- join feature nodes to their centralities via vertex_id ------------------
+  df2 <- df |>
+    dplyr::left_join(
+      node_centrality,
+      by = c("feature_vertex_id" = "name")  # name is vertex_id in the graph
+    )
+
+  # --- aggregate to exposure-level impact -------------------------------------
+  impact_df <- df2 |>
+    dplyr::filter(!is.na(.data$centrality_degree)) |>
+    dplyr::group_by(.data[[exposure_col]]) |>
+    dplyr::summarise(
+      mean_degree      = mean(centrality_degree,      na.rm = TRUE),
+      mean_eigen       = mean(centrality_eigen,       na.rm = TRUE),
+      mean_closeness   = mean(centrality_closeness,   na.rm = TRUE),
+      mean_betweenness = mean(centrality_betweenness, na.rm = TRUE),
+      n_features       = dplyr::n(),
+      .groups = "drop"
+    ) |> 
+    left_join(
+      expomicset@metadata$codebook,
+      by=c("exposure"="variable")
+    )
+
+  result <- list(exposure_impact = impact_df)
+
+  if (action == "add") {
+    all_metadata <- MultiAssayExperiment::metadata(expomicset)
+    all_metadata$network$exposure_impact[[feature_type]] <- result
+    MultiAssayExperiment::metadata(expomicset) <- all_metadata
+
+    step_record <- list(run_exposure_impact = list(
+      timestamp = Sys.time(),
+      params    = list(feature_type = feature_type, pval_col = pval_col, pval_thresh = pval_thresh),
+      notes     = paste("Computed exposure impact using", feature_type, "correlation network.")
+    ))
+    MultiAssayExperiment::metadata(expomicset)$summary$steps <-
+      c(MultiAssayExperiment::metadata(expomicset)$summary$steps, step_record)
+
+    return(expomicset)
+  } else {
+    return(result)
+  }
+
+  
+```
+
+
+#### Network Impact Analysis
+
+```{r}
+#| fig-width: 4
+#| fig-height: 12
+
+
+fev1_fvc_expom_degs <- fev1_fvc_expom_degs |>
+    run_exposure_impact(feature_type = "degs",
+                        pval_col = "P.Value",
+                        pval_thresh = 0.05)
+
+# Plot exposure-omics impact results
+fev1_fvc_expom_degs |>
+    plot_exposure_impact(
+        feature_type = "degs",
+        min_per_group = 10,
+        bar_cols = "none"
+    )
+```
+
+
+#### Test Enrichment
+
+```{r}
+#| fig-height: 18
+#| fig-width: 12
+
+
+# Run enrichment analysis on factor features correlated with exposures
+a <- fev1_fvc_expom_degs |>
+    run_enrichment(
+        feature_type = c("degs_cor"),
+        feature_col = "feature_map",
+        db = c("GO"),
+        species = "goa_human",
+        fenr_col = "gene_symbol",
+        padj_method = "none",
+        pval_thresh = 0.1,
+        min_set = 1,
+        max_set = 800,
+        clustering_approach = "diana",
+        action = "add"
+    )
+
+b <- fev1_fvc_expom_degs |>
+    run_enrichment(
+        feature_type = c("omics"),
+        variable_map = fev1_fvc_expom_degs@metadata |> 
+          pluck("differential_analysis","differential_abundance") |> 
+          filter(P.Value<0.05) |> 
+          dplyr::select(
+            feature=feature_map,
+            exp_name=exp_name
+          ),
+        feature_col = "feature_map",
+        db = c("GO"),
+        species = "goa_human",
+        fenr_col = "gene_symbol",
+        padj_method = "none",
+        pval_thresh = 1,
+        min_set = 1,
+        max_set = 800,
+        clustering_approach = "diana",
+        action = "add"
+    )
+
+a |>
+    plot_enrichment(
+        feature_type = "degs_cor",
+        plot_type = "dotplot",
+        top_n = 10,
+        add_top_genes = TRUE,
+        top_n_genes = 5
+    )
+```
+
+
+
+### Multi-omics Exposure Association
+
+```{r}
+#| fig-width: 12
+#| fig-height: 13
+
+
+# top_factor_features <- fev1_fvc_expom |>
+#     extract_results(result = "multiomics_integration") |>
+#     pluck("top_factor_features") |>
+#     dplyr::select(
+#         variable = feature,
+#         exp_name
+#     )
+
+asthma_sev_features <- fev1_fvc_expom_degs@metadata$differential_analysis$differential_abundance |>
+  filter(P.Value<.05 & logFC<0 & abs(logFC)>log(1)) |> 
+  dplyr::select(variable=feature,exp_name) 
+  # filter(exp_name %in% c(
+  #   asthma_sev_features |>
+  #     tabyl(exp_name) |> 
+  #     filter(n>10) |> 
+  #     pull(exp_name)
+  # ))
+
+# Correlate top factor features with exposures
+fev1_fvc_expom_int <- fev1_fvc_expom |>
+    # Perform correlation analysis between factor features
+    # and exposures
+    run_correlation(
+        feature_type = "omics",
+        variable_map = asthma_sev_features,
+        exposure_cols = num_exp_vars,
+        action = "add",
+        correlation_cutoff = 0.3,
+        pval_cutoff = 0.05,
+        cor_pval_column = "p.value"
+    ) |>
+    # Perform correlation analysis between factor features
+    run_correlation(
+        feature_type = "omics",
+        variable_map = asthma_sev_features,
+        feature_cors = TRUE,
+        action = "add",
+        correlation_cutoff = 0.3,
+        pval_cutoff = 0.05,
+        cor_pval_column = "p.value"
+    )
+
+fev1_fvc_expom_int |>
+    plot_correlation_summary(
+        mode = "summary",
+        feature_type = "omics"
+    ) &
+  plot_layout(heights = c(5,2))
+```
+
+#### Proportion of Assay Correlations per Exposure Category
+
+```{r}
+#| fig-width: 6
+#| fig-height: 4
+fev1_fvc_expom_int@metadata$correlation$omics |> 
+  tabyl(category, exp_name) |> 
+  pivot_longer(-category,
+               names_to = "exp_name", 
+               values_to = "count") |> 
+  ggplot(aes(x = category,
+             y = count,
+             fill = exp_name)) +
+  geom_bar(stat = "identity", 
+           position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "",
+    y = "Proportion",
+    fill = "Exposure",
+    title = "Proportion of Omics type by Exposure Category"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  scale_fill_npg()
+```
+
+#### Exposure Associations Normalized to # of Exposures
+
+```{r}
+#| fig-height: 3
+#| fig-width: 6
+fev1_fvc_expom_int@metadata$correlation$omics |>
+  group_by(category) |> 
+  reframe(
+    n=n(),
+    unique_vars=length(unique(exposure)),
+    prop=n/unique_vars
+  ) |> 
+  filter(unique_vars>1) |> 
+  ggplot(aes(x = prop, 
+             y = reorder(category,prop),
+             fill = category)) +
+     geom_col() +
+     labs(
+       x = "No. of Assocations/No. Unique Variables",
+       y = "",
+       title = "Exposure Associations",
+       subtitle = "Normalized to No. of Exposures"
+     ) +
+     theme_minimal(base_size = 14)+
+  scale_fill_npg()+
+  theme(legend.position = "none")
+  
+  
+```
+
+#### Number of Shared Features
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+fev1_fvc_expom_int |>
+    plot_circos_correlation(
+        feature_type = "omics",
+        shared_cutoff = 10,
+        low = "blue4",
+        mid="white",
+        high = "red4",
+        midpoint = 50
+    )
+```
+#### Network Creation
+
+```{r}
+fev1_fvc_expom_int <- fev1_fvc_expom_int |>
+    run_create_network(
+        feature_type = "omics_feature_cor",
+        action = "add"
+    ) |>
+    run_create_network(
+        feature_type = "omics",
+        action = "add"
+    )
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+fev1_fvc_expom_int |>
+    plot_network(
+        network = "omics",
+        top_n_nodes = 100,
+        include_stats = TRUE,
+        cor_thresh = 0.3,
+        node_color_var = "group",
+        label = TRUE,
+        label_top_n = 10
+    )
+
+```
+
+#### Network Impact Analysis
+
+```{r}
+#| fig-width: 4
+#| fig-height: 12
+
+
+fev1_fvc_expom_int <- fev1_fvc_expom_int |>
+    run_exposure_impact(feature_type = "omics",
+                        pval_col = "P.Value",
+                        pval_thresh = 0.05)
+
+# Plot exposure-omics impact results
+fev1_fvc_expom_int |>
+    plot_exposure_impact(
+        feature_type = "omics",
+        min_per_group = 10,
+        bar_cols = "none"
+    )
+```
+
+
+#### Test Enrichment
+
+```{r}
+#| fig-height: 18
+#| fig-width: 12
+
+
+# Run enrichment analysis on factor features correlated with exposures
+a <- fev1_fvc_expom_int |>
+    run_enrichment(
+        feature_type = c("omics_cor"),
+        # variable_map = asthma_sev_features |> 
+        #   dplyr::select(exp_name,
+        #                 feature=variable),
+        feature_col = "feature_map",
+        db = c("GO"),
+        species = "goa_human",
+        fenr_col = "gene_symbol",
+        padj_method = "none",
+        pval_thresh = 0.1,
+        min_set = 1,
+        max_set = 800,
+        clustering_approach = "diana",
+        action = "add"
+    )
+
+a |>
+    plot_enrichment(
+        feature_type = "omics_cor",
+        plot_type = "dotplot",
+        top_n = 10,
+        add_top_genes = TRUE,
+        top_n_genes = 5
+    )
+
+b <- a |> pivot_feature()
+
+bg <- b |> 
+  filter(.exp_name=="CD4 T cell Isoforms") |> 
+  pull(feature_map) |> 
+  unique()
+
+sel <- b |> 
+  filter(.feature %in% 
+           (a@metadata$correlation$omics |>
+              filter(category=="Indoor Pollution") |>
+              pull(feature))) |> 
+  pull(feature_map) 
+
+c <- run_fenr(selected_genes = sel,
+              universe_genes = bg,
+              db = "GO",
+              species = "goa_human",
+              feature_col = "gene_symbol")
+```
+## Chemical Effects
+
+```{r}
+x <- map(exp_vars,~{
+  message("Working on: ",.x)
+  res <- fev1_fvc_expom |>
+    run_differential_abundance(
+        formula = as.formula(paste0("~ ",.x, " + gli_age + gli_sex + black + fiscat4 + bmizscore + season + med_ics")),
+        method = "limma_trend",
+        scaling_method = "none",
+        action = "get"
+    ) |> 
+    filter(P.Value<0.05,
+           abs(logFC)>log2(1)) |> 
+    mutate(exposure=.x)
+})
+
+names(x) <- exp_vars
+
+y <- bind_rows(x,.id="exposure")
+
+z <- c(
+  x,
+  list("FEV1/FVC"=fev1_fvc_expom_degs@metadata$differential_analysis$differential_abundance |>
+         filter(P.Value<0.05,abs(logFC)>log2(1)) )
+) |> 
+  map(~{
+    .x |> 
+      mutate(combo=paste(exp_name,feature_map,sep = " ")) |> 
+      pull(combo) |> 
+      unique()
+  }) |> 
+  get_pairwise_overlaps()
+
+z |> 
+    filter(target=="FEV1/FVC") |> 
+    tidygraph::as_tbl_graph() |> 
+    ggraph::ggraph(
+        layout = "linear",
+        circular = TRUE
+    ) +
+    ggraph::geom_edge_arc(aes(
+        color = jaccard,
+        width = log10(num_shared+1)
+    )) +
+    ggraph::geom_node_point(shape = 21,
+                            size = 4,
+                            alpha = 0.8
+    ) +
+    ggraph::geom_node_text(
+        aes(
+            label = name,
+            x = 1.1 * x,
+            y = 1.1 * y,
+            angle = ggraph::node_angle(x, y)
+        ),
+        hjust = "outward",
+        fontface = "bold.italic",
+        check_overlap = TRUE
+    ) +
+    ggraph::theme_graph() +
+    ggraph::scale_edge_color_gradient2(
+        high = "#0f0c29",
+        mid = "white",
+        low = "#43C6AC",
+        midpoint = 0.1,
+        guide = ggraph::guide_edge_colorbar()
+    ) +
+    ggplot2::coord_fixed(xlim = c(-2, 2), ylim = c(-2, 2)) +
+    ggplot2::guides(edge_width = "none") +
+    ggplot2::labs(
+        edge_color = "Jaccard Coef."
+    )
+```
+
+
+```{r}
+
+yy=y |> 
+  left_join(
+    fev1_fvc_expom_degs@metadata$codebook,
+    by=c("exposure"="variable"))
+
+yyy <- yy |> 
+  inner_join(
+    fev1_fvc_expom@metadata |> 
+      pluck("differential_analysis",
+            "differential_abundance") |> 
+      filter(P.Value<0.05,
+             abs(logFC)>log2(1)) |>
+      dplyr::select(feature,exp_name) |>
+      distinct(),
+    by=c("feature"="feature",
+         "exp_name"="exp_name")
+  )
+
+net <- fev1_fvc_expom |>
+    # Perform correlation analysis between factor features
+    run_correlation(
+        feature_type = "omics",
+        variable_map = asthma_sev_features,
+        feature_cors = TRUE,
+        action = "add",
+        correlation_cutoff = 0.3,
+        pval_cutoff = 0.05,
+        cor_pval_column = "p.value"
+    )
+
+net <- net |>
+    run_create_network(
+        feature_type = "omics_feature_cor",
+        action = "add"
+    )
+  
+
+cor_df <- fev1_fvc_expom_int@metadata |> 
+  pluck("correlation",
+        "omics_feature_cor") |>
+  mutate(bw=case_when(
+    exp_name_1 != exp_name_2 ~ "across",
+    exp_name_1 == exp_name_2 ~ "within"
+  ))
+
+c <- yy |> 
+  mutate(combo=paste(exp_name,feature_map,sep = " ")) |> 
+  group_by(category) |> 
+  reframe(n=paste(
+    names(table(combo)[table(combo)>1]),
+  ),
+  exp_name=exp_name)
+
+c <- 
+```
+
+
+## Summary
+
+*   
+
+## Save Data
+
+```{r}
+# Save MultiAssayExperiment Objects
+```
+
+## Session Info
+
+```{r}
+sessionInfo()
+```

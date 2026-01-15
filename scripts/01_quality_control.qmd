@@ -1,0 +1,397 @@
+---
+title: "Exposome AIRWAYS Analysis"
+subtitle: "Quality Control Analysis"
+author: "Jason Laird"
+date: today 
+date-format: short
+engine: knitr
+execute: 
+  warning: false
+  message: false
+  cache: true
+format: 
+  html:
+    code-fold: true
+    theme: 
+      - simplex
+      - custom.scss
+    fontcolor: '#0c051a'
+---
+
+
+## Setup 
+
+### Load Libraries
+
+```{r}
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(janitor)
+library(ggpubr)
+library(tidyexposomics)
+library(MultiAssayExperiment)
+```
+
+### Load Data
+
+```{r}
+# Meta Data
+aw_meta_cv2 <- readRDS("../results/input_data/aw_meta_cv2.rds")
+
+# Codebook
+aw_cb <- readRDS("../results/input_data/aw_cb.rds")
+
+# Abundance/Expression Data
+cd4_gene_counts   <- readRDS("../results/input_data/cd4_gene_counts.rds")
+cd16_gene_counts  <- readRDS("../results/input_data/cd16_gene_counts.rds")
+
+cd4_isoform_counts  <- readRDS("../results/input_data/cd4_isoform_counts.rds")
+cd16_isoform_counts <- readRDS("../results/input_data/cd16_isoform_counts.rds")
+
+prot_abd <- readRDS("../results/input_data/prot_abd.rds")
+adduct   <- readRDS("../results/input_data/adduct.rds")
+adduct_load   <- readRDS("../results/input_data/adduct_load.rds")
+
+# Feature Data
+gene_fdata    <- readRDS("../results/input_data/gene_fdata.rds")
+isoform_fdata <- readRDS("../results/input_data/isoform_fdata.rds")
+prot_fdata    <- readRDS("../results/input_data/prot_fdata.rds")
+adduct_fdata  <- readRDS("../results/input_data/adduct_fdata.rds")
+adduct_load_fdata <- readRDS("../results/input_data/adduct_load_fdata.rds")
+
+```
+
+
+### Prepare Data Format
+
+```{r}
+omics_list <- list(
+  "CD4 T cell RNA"       = cd4_gene_counts,
+  "CD16 Monocyte RNA"      = cd16_gene_counts,
+  "CD4 T cell Isoforms"  = cd4_isoform_counts,
+  "CD16 Monocyte Isoforms" = cd16_isoform_counts,
+  "Proteomics"            = prot_abd,
+  "Adductomics"           = adduct,
+  "Adduct Burden"      = adduct_load
+)
+
+fdata <- list(
+  "CD4 T cell RNA"       = gene_fdata,
+  "CD16 Monocyte RNA"      = gene_fdata,     
+  "CD4 T cell Isoforms"  = isoform_fdata,
+  "CD16 Monocyte Isoforms" = isoform_fdata,   
+  "Proteomics"            = prot_fdata,
+  "Adductomics"           = adduct_fdata,
+  "Adduct Burden"      = adduct_load_fdata
+)
+
+rm(list = ls()[grepl("_fdata|counts|_abd|adduct", ls())])
+
+
+expom <- create_exposomicset(
+  codebook = aw_cb,
+  exposure = aw_meta_cv2,
+  omics = omics_list,
+  row_data = fdata
+)
+
+# Keep samples with sex and age
+expom <- expom[,!is.na(expom$age) & !is.na(expom$gli_sex)]
+
+exp_cat <- c(
+  "Indoor Air",
+  "Parabens",
+  "Phenols",
+  "Antimicrobials",
+  
+  "Dust Allergens",
+  "IgE Respiratory",
+  "IgE Superantigen",
+  "IgE Total",
+  "IgE Food",
+  
+  "Serum Essential Metals",
+  "Serum Non-Essential Metals",
+  "Urine Essential Metals",
+  "Urine Non-Essential Metals"
+  
+  )
+
+exp_vars <- extract_results(exposomicset = expom,result = "codebook") |>
+  filter(category %in% exp_cat) |> 
+  pull(variable)
+```
+
+## Missingness/Imputation
+
+```{r}
+#| fig-width: 6
+#| fig-height: 6
+expom |>
+    plot_missing(
+        plot_type = "summary",
+        threshold = 20
+    )
+```
+
+### LOD Impute Before Removal
+
+Keeping variables where missingness may be due to non-detects
+
+#### Fix
+
+```{r}
+trace(run_impute_missing,edit=T)
+# remove if condition and replace with:
+# (!is.null(exposure_impute_method))
+```
+
+```{r}
+# Grab codebook variables that are actually in colData
+codebook_vars <- extract_results(expom, result = "codebook") |>
+  filter(variable %in% (
+    expom |> tidyexposomics::pivot_sample() |> colnames()
+  ))
+
+# LOD-style imputation
+lod_cats <- c(
+  
+  "Indoor Air",
+  "Parabens",
+  "Phenols",
+  "Antimicrobials",
+  
+  "Dust Allergens",
+  "IgE Respiratory",
+  "IgE Superantigen",
+  "IgE Total",
+  "IgE Food",
+  
+  "Serum Essential Metals",
+  "Serum Non-Essential Metals",
+  "Urine Essential Metals",
+  "Urine Non-Essential Metals",
+  
+  "Serum Cytokines",
+  "Nasal Cytokines"
+  
+)
+
+# Split into two lists of variables
+lod_vars <- codebook_vars |> 
+  filter(category %in% lod_cats) |> 
+  pull(variable)
+
+# remove variables with no variance
+lod_vars <- expom |>
+  tidyexposomics::pivot_sample() |>
+  dplyr::select(all_of(lod_vars)) |>
+  apply(2,function(col){
+    var <- col[!is.na(col)] |> var();
+    return(var>0)
+  }) |> 
+  (\(bool) bool[bool %in% c(TRUE)])() |> 
+  names()
+
+# now confirm the missingness of each:
+lod_vars <- expom |> 
+  tidyexposomics::pivot_sample() |> 
+  dplyr::select(all_of(lod_vars)) |> 
+  naniar::miss_var_summary() |> 
+  filter(pct_miss!=100) |> 
+  pull(variable)
+
+# looks like half the samples were just not profiled
+# for some chemicals, removing these since 
+# they are not non-detects
+lod_vars <- lod_vars[!grepl("_sg",lod_vars)]
+  
+# now let's impute
+expom <- expom |>
+  run_impute_missing(
+    exposure_impute_method = "lod_sqrt2",
+    exposure_cols = lod_vars
+  ) 
+```
+
+### Filter Missing Variables
+
+```{r}
+#| message: false
+#| warning: false
+
+
+expom <- expom |> 
+  filter_missing(na_thresh = 20)
+
+# update exp vars after filtering
+exp_vars <- exp_vars[
+  exp_vars %in% names(colData(expom))
+]
+
+```
+
+### Impute using MissForest for the Other Variables
+
+```{r}
+# Define missForest variables to impute
+mf_vars <- expom |>
+    tidyexposomics::pivot_sample() |> 
+  naniar::miss_var_summary() |> 
+  filter(pct_miss>0) |> 
+  pull(variable)
+
+# Now run imputation by bucket
+expom <- expom |>
+  run_impute_missing(
+    exposure_impute_method = "missforest",
+    exposure_cols = mf_vars,
+    omics_impute_method  = "missforest",
+    omics_to_impute = c(
+      "Proteomics","Adductomics")
+  ) 
+  
+```
+
+
+## Filtering Omics
+
+```{r}
+expom <- expom |>
+    filter_omics(
+        method = "expression",
+        assays = "CD4 T cell RNA",
+        assay_name = 1,
+        min_value = 1,
+        min_prop = 0.3
+    ) |>
+  filter_omics(
+        method = "expression",
+        assays = "CD16 Monocyte RNA",
+        assay_name = 1,
+        min_value = 1,
+        min_prop = 0.3
+    ) |>
+  filter_omics(
+        method = "expression",
+        assays = "CD4 T cell Isoforms",
+        assay_name = 1,
+        min_value = 1,
+        min_prop = 0.3
+    ) |>
+  filter_omics(
+        method = "expression",
+        assays = "CD16 Monocyte Isoforms",
+        assay_name = 1,
+        min_value = 1,
+        min_prop = 0.3
+    ) |>
+    filter_omics(
+        method = "variance",
+        assays = "Proteomics",
+        assay_name = 1,
+        min_var = 0.01
+    ) 
+```
+
+## Normality Check
+
+```{r}
+
+num_exp_vars <- expom |>
+  tidyexposomics::pivot_sample() |> 
+  dplyr::select(all_of(exp_vars)) |> 
+  dplyr::select_if(is.numeric) |> 
+  dplyr::select_if(~length(unique(.))>3) |> 
+  # keeping temperature as is
+  dplyr::select(-c(iv_tempavg)) |> 
+  colnames()
+
+# Check variable normality & transform variables
+expom <- expom |>
+    # Check variable normality
+    run_normality_check(action = "add")  |> 
+    # Transform variables
+    transform_exposure(
+        transform_method = "log2",
+        exposure_cols = num_exp_vars
+    )
+```
+
+## PCA 
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+
+
+# Perform principal component analysis
+expom <- expom |>
+    run_pca(
+        log_trans_exp = TRUE,
+        log_trans_omics = TRUE,
+        action = "add"
+    )
+# Plot principal component analysis results
+expom |>
+    plot_pca()
+```
+
+```{r}
+# Filter out sample outliers
+expom <- expom |>
+    filter_sample_outliers(
+        outliers = c("s937", "s3331","s3692")
+    )
+```
+
+## Principal Component Correlation
+
+```{r}
+#| fig-width: 8
+#| fig-height: 10
+expom <- expom |>
+    run_correlation(
+        feature_type = "pcs",
+        exposure_cols = num_exp_vars,
+        n_pcs = 30,
+        action = "add",
+        correlation_cutoff = 0,
+        pval_cutoff = 1
+    )
+
+expom |>
+    plot_correlation_tile(
+        feature_type = "pcs",
+        pval_cutoff = 0.1
+    )
+```
+## Summary
+
+* Adductomics data have the most missing data, followed by exposures, then proteomics.
+
+* Most variables are not normally distributed.
+
+* Variation in the omics data appears to be primarily driven by transcriptomics data.
+
+* Two outliers were detected and removed from the data.
+
+* Urinary metals and several IgE subtypes are associated with the most principal components, and likely are associated with features that vary in our data.
+
+
+## Save Data
+
+```{r}
+saveRDS(expom,file="../results/qc/expom.rds")
+saveRDS(exp_vars,file="../results/qc/exp_vars.rds")
+saveRDS(num_exp_vars,file="../results/qc/num_exp_vars.rds")
+```
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
+

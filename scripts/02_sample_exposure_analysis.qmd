@@ -1,0 +1,1930 @@
+---
+title: "Exposome AIRWAYS Analysis"
+subtitle: "ExWAS"
+author: "Jason Laird"
+date: today 
+date-format: short
+engine: knitr
+execute: 
+  warning: false
+  message: false
+  cache: true
+format: 
+  html:
+    code-fold: true
+    theme: 
+      - simplex
+      - custom.scss
+    fontcolor: '#0c051a'
+---
+
+## Setup
+
+### Load Libraries
+
+```{r}
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(janitor)
+library(ggpubr)
+library(tidyexposomics)
+library(MultiAssayExperiment)
+library(biostats)
+library(glmnet)
+
+invisible(lapply(
+  list.files(path = "./",
+             pattern="*.R",full.names = TRUE),
+  source))
+```
+
+### Load Data
+
+```{r}
+# MultiAssayExperiment Object
+expom <- readRDS("../results/qc/expom.rds")
+
+# Codebook - Filtered to include variables
+# retained in MultiAssayExperiment Object
+aw_cb <- readRDS("../results/input_data/aw_cb.rds") |> 
+  filter(variable %in% colnames(colData(expom)))
+
+# Exposure variables
+exp_vars <- readRDS("../results/qc/exp_vars.rds")
+num_exp_vars <- readRDS("../results/qc/num_exp_vars.rds")
+
+# All variables
+vars <- aw_cb$variable |> 
+  (\(chr)chr[chr %in% colnames(colData(expom))])()
+
+# Setting colors for exposure categories
+cat_colors <- scales::alpha(get_palette("aaas",13), 0.5) |> 
+  (\(colors){
+    names(colors) <- aw_cb |> 
+      filter(variable %in% exp_vars) |> 
+      pull(category) |> 
+      unique()
+    colors
+  })()
+```
+
+## Sample Clustering
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+
+
+# Sample clustering
+expom <- expom |>
+    run_cluster_samples(
+        exposure_cols = num_exp_vars,
+        clustering_approach = "elbow",
+        action = "add"
+    )
+
+expom |>
+    plot_sample_clusters(
+        exposure_cols = num_exp_vars
+    )
+```
+
+## Exposure Correlations
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+
+num_vars <- expom@colData |>
+  as_tibble() |>
+  select_if(is.numeric) |> 
+  (\(df){df[,colnames(df) %in% vars]})() |> 
+  colnames()
+
+expom <- expom |>
+    run_correlation(
+        feature_type = "exposures",
+        action = "add",
+        exposure_cols = num_vars,
+        correlation_cutoff = 0.3
+    )
+
+expom |>
+    plot_circos_correlation(
+        feature_type = "exposures",
+        corr_threshold = 0.5,
+        exposure_cols = num_vars,
+        annotation_colors = get_palette("jco",k=42) |> 
+          (\(colors){
+            names(colors) <- unique(aw_cb$category)
+            colors
+          })()
+        
+    )
+```
+
+### Exposure Correlation Circos
+
+```{r}
+cors <- expom |>
+    run_correlation(
+        feature_type = "exposures",
+        action = "get",
+        exposure_cols = exp_vars,
+        correlation_cutoff = 0,
+        pval_cutoff = 1
+    )
+
+
+cor_g <- cors |>
+    filter(
+        p.value < 0.05,
+        abs(correlation) > 0.3
+    ) |>
+    tidygraph::as_tbl_graph(directed = FALSE) |>
+    tidygraph::activate(nodes) |>
+    mutate(
+        community = tidygraph::group_louvain(
+            weights = abs(correlation)
+        ),
+        strength = tidygraph::centrality_degree(
+            weights = abs(correlation)
+        ),
+        top_lab =if_else(strength > 10, name, NA_character_)
+    ) |> 
+    left_join(aw_cb,
+              by=c("name"="variable")) |> 
+  tidygraph::rename(Category=category)
+
+cor_g <- cor_g |> 
+    group_by(Category) |> 
+    arrange(desc(strength), .by_group = TRUE) |>
+    mutate(
+        top_lab = if_else(name %in% c(
+            cor_g |>
+                as.data.frame() |> 
+                group_by(Category) |> 
+                arrange(desc(strength),
+                        .by_group = TRUE) |> 
+                tidygraph::slice_head(n=2) |>
+                pull(name)
+        ), name, NA_character_)
+    ) |>
+    ungroup()
+
+
+
+cor_g |>
+    ggraph::ggraph(
+        layout = "fr"
+    ) +
+    ggraph::geom_edge_link(
+        aes(
+            color = correlation,
+            width = abs(correlation)*5
+        )
+    ) +
+    ggraph::geom_node_point(aes(fill=Category,size=strength),
+                            shape = 21,
+                            #size = 4,
+                            alpha = 0.8
+    ) +
+    scale_fill_manual(values=cat_colors)+
+    ggraph::geom_node_label(
+        aes(
+            label = top_lab
+        ),
+        fontface = "bold.italic",repel = T,
+        na.rm = TRUE
+    ) +
+    ggraph::theme_graph() +
+    ggraph::scale_edge_color_gradient2(
+        high = "#C33764",
+        mid  = "white",
+        low  = "#1D2671",
+        midpoint = 0.1,
+        guide = ggraph::guide_edge_colorbar()
+    ) +
+    guides(
+        fill = guide_legend(
+            override.aes = list(size = 4)
+        ),size = "none",
+        edge_width = "none"
+    )+
+    ggplot2::labs(edge_color = "Correlation")
+
+```
+
+
+### Exposure Corr. Heatmap
+
+```{r}
+cors |>
+    select(var1, var2, correlation) |>
+    
+    # --- Build correlation matrix ---
+    pivot_wider(names_from = var2, values_from = correlation) |>
+    column_to_rownames("var1") |>
+    (\(mat){ mat[is.na(mat)] <- 0; mat })() |>
+    
+    # --- Wrap into pheatmap call ---
+    (\(mat){
+        
+        # Row annotation (aw_cb$type mapped to matching variables)
+        row_ann <- aw_cb |>
+            select(variable, category) |>
+            filter(variable %in% rownames(mat)) |>
+            distinct() |>
+            column_to_rownames("variable")
+        
+        # Column annotation
+        col_ann <- aw_cb |>
+            select(variable, category) |>
+            filter(variable %in% colnames(mat)) |>
+            distinct() |>
+            column_to_rownames("variable")
+        
+        # Colors for main heatmap
+        heat_cols <- colorRampPalette(c("#1d2671","white","#c33764"))(100)
+        
+        # Category colors for annotations
+        cats <- unique(c(row_ann$category, col_ann$category))
+        ann_cols <- list(
+            # category = setNames(
+            #     scales::alpha(get_palette("aaas",length(cats)), 0.5),
+            #     cats
+            # )
+            category = cat_colors
+        )
+        
+        pheatmap::pheatmap(
+            mat,
+            color = heat_cols,
+            breaks = seq(-1, 1, length.out = 101),
+            border_color = NA,
+            annotation_row = row_ann,
+            annotation_col = col_ann,
+            annotation_colors = ann_cols,
+            fontsize = 9
+        )
+    })()
+
+```
+
+### Category Correlations
+
+```{r}
+cor_sum_df <- cors |>
+  select(var1, var2, correlation) |>
+
+  # --- Bring categories into long form first ---
+  left_join(aw_cb |> select(variable, category),
+            by = c("var1" = "variable")) |>
+  dplyr::rename(cat1 = category) |>
+  left_join(aw_cb |> select(variable, category),
+            by = c("var2" = "variable")) |>
+  dplyr::rename(cat2 = category) |>
+
+  # --- Drop rows without category info ---
+  filter(!is.na(cat1), !is.na(cat2)) |>
+
+  # --- Label within vs. between correlation types ---
+  mutate(
+    corr_type = if_else(cat1 == cat2, "Within-category", "Between-category"),
+    pair_category = if_else(cat1 == cat2, cat1, "Between")
+  ) 
+
+
+cor_sum_df |> 
+  mutate(combo=paste(cat1,cat2)) |> 
+  group_by(combo) |> 
+  reframe(med_cor=median(correlation),cat1,cat2) |>
+  distinct() |>
+  dplyr::select(cat1,cat2,med_cor) |> 
+    tidygraph::as_tbl_graph() |> 
+    ggraph::ggraph(
+        layout = "linear",
+        circular = TRUE
+    ) +
+    ggraph::geom_edge_arc(aes(
+        color = med_cor,
+        width = abs(med_cor)*10
+    )) +
+    ggraph::geom_node_point(shape = 21,
+                            size = 4,
+                            alpha = 0.8
+    ) +
+    ggraph::geom_node_text(
+        aes(
+            label = name,
+            x = 1.1 * x,
+            y = 1.1 * y,
+            angle = ggraph::node_angle(x, y)
+        ),
+        hjust = "outward",
+        fontface = "bold.italic",
+        check_overlap = TRUE
+    ) +
+    ggraph::theme_graph() +
+    ggraph::scale_edge_color_gradient2(
+        high = "#C33764",
+        mid = "white",
+        low = "#1D2671",
+        midpoint = 0.1,
+        guide = ggraph::guide_edge_colorbar()
+    ) +
+    ggplot2::coord_fixed(xlim = c(-2, 2), ylim = c(-2, 2)) +
+    ggplot2::guides(edge_width = "none") +
+    ggplot2::labs(
+        edge_color = "Median Correlation"
+    )
+```
+
+
+### Within Category Correlations
+
+```{r}
+cor_sum_df |>
+    filter(corr_type == "Within-category") |>
+    ggplot(aes(x = reorder(cat1,correlation), 
+               y = correlation,
+               fill = cat1)) +
+    geom_boxplot(alpha = 0.7,linewidth=0.005) +
+    geom_jitter(aes(color=cat1),alpha=.1)+
+    theme_classic(base_size = 12) +
+    scale_fill_manual(values=cat_colors)+
+    scale_color_manual(values=cat_colors)+
+    labs(title = "",
+         x = "",
+         y = "Correlation") +
+    guides(color="none",
+           fill="none")+geom_hline(yintercept = 0,linetype="dashed",color="grey25")+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+cor_sum_df |>
+    filter(corr_type == "Within-category") |>
+    ggplot(aes(y = reorder(cat1,correlation), 
+               x = correlation,
+               fill = cat1)) +
+    geom_boxplot(alpha = 0.7,linewidth=0.005) +
+    geom_jitter(aes(color=cat1),alpha=.1)+
+    theme_classic(base_size = 12) +
+    scale_fill_manual(values=cat_colors)+
+    scale_color_manual(values=cat_colors)+
+    labs(title = "",
+         y = "",
+         x = "Correlation") +
+    guides(color="none",
+           fill="none")+
+  geom_vline(xintercept = 0,
+             linetype="dashed",
+             color="grey25")+
+    theme(axis.text.y = element_text(angle = 45, hjust = 1))
+```
+
+
+### Variable Correlations with FEV1/FVC
+
+```{r}
+#| fig-width: 4
+#| fig-height: 3
+extract_results(expom,result = "correlation") |>
+    pluck("exposures") |> 
+    filter(var1=="pftfev1fvc_actual",
+           !grepl("^pft",var2)) |> 
+    ggplot(aes(x = correlation, 
+               y = reorder(var2,correlation),
+               fill = correlation)) +
+    geom_bar(stat = "identity",color="black",linewidth = 0.005)+
+    scale_fill_gradient2(
+        low = "blue4", 
+        mid = "white",
+        high = "red4",
+        midpoint = 0
+    ) +
+    labs(
+        x = "Correlation",
+        y = NULL,
+        fill = "Correlation"
+    ) +
+    theme_classic() +
+    theme(
+        legend.position = "right"
+    )
+      
+```
+### PM10 Correlations
+
+```{r}
+#| fig-width: 5
+#| fig-height: 7
+extract_results(expom,result = "correlation") |>
+    pluck("exposures") |> 
+    filter(var1=="pm10f",
+           !grepl("^pft",var2)) |> 
+    ggplot(aes(x = correlation, 
+               y = reorder(var2,correlation),
+               fill = correlation)) +
+    geom_bar(stat = "identity",color="black",linewidth = 0.005)+
+    scale_fill_gradient2(
+        low = "blue4", 
+        mid = "white",
+        high = "red4",
+        midpoint = 0
+    ) +
+    labs(
+        x = "Correlation",
+        y = NULL,
+        fill = "Correlation"
+    ) +
+    theme_classic() +
+    theme(
+        legend.position = "right"
+    )
+```
+## Cohort Characterization
+
+### Table 1 - Cohort
+
+```{r}
+library(gtsummary)
+
+expom |> 
+    tidyexposomics::pivot_sample() |>
+  mutate(gli_sex=case_when(
+    gli_sex=="M" ~ "Male",
+    gli_sex=="F" ~ "Female"
+  ),
+  black = case_when(
+    black == "black" ~ "Black",
+    black == "non-black" ~ "Non-Black"
+  ),
+  income5 = case_when(
+    income5 == "RA/DK" ~ "No Response",
+    .default = income5
+  )) |> 
+    transmute(
+        Sex     = factor(gli_sex),
+        `Age (yrs)`     = as.numeric(gli_age),
+        `Height (cm)`  = as.numeric(gli_height),
+        Ancestry       = factor(black, 
+                                levels = c("Non-Black", "Black")),
+        `FEV1/FVC` = pftfev1fvc_actual,
+        BMI     = factor(bmicat4),
+        `Household Income` = income5
+    ) |> tbl_summary(
+    statistic = list(
+        all_continuous() ~ "{mean} ({sd})",
+        all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    missing = "no"
+) |> 
+    modify_header(label = "**Characteristic**") |> 
+    bold_labels()
+
+
+```
+### Table 2 - Difference in FEV1/FVC
+
+```{r}
+lm(
+    `FEV1/FVC` ~ Sex + Ancestry + BMI + `Household Income` + `Age (yrs)` + `Height (cm)`,
+    data = expom |> 
+        tidyexposomics::pivot_sample() |>
+        mutate(gli_sex=case_when(
+            gli_sex=="M" ~ "Male",
+            gli_sex=="F" ~ "Female"
+        ),
+        black = case_when(
+            black == "black" ~ "Black",
+            black == "non-black" ~ "Non-Black"
+        ),
+        income5 = case_when(
+            income5 == "RA/DK" ~ "No Response",
+            .default = income5
+        )) |> 
+        transmute(
+            Sex     = factor(gli_sex),
+            `Age (yrs)`     = as.numeric(gli_age),
+            `Height (cm)`  = as.numeric(gli_height),
+            Ancestry       = factor(black, 
+                                    levels = c("Non-Black", "Black")),
+            `FEV1/FVC` = pftfev1fvc_actual,
+            BMI     = factor(bmicat4),
+            `Household Income` = income5
+        )
+) |> 
+  bold_labels() |> 
+    gtsummary::tbl_regression()
+```
+
+
+## Cell Type Analysis
+
+### CBC Differential
+
+```{r}
+# Perform ExWAS Analysis
+cell_res <- expom |>
+    run_association(
+        source = "exposures",
+        outcome = "pftfev1fvc_actual",
+        feature_set = aw_cb |>
+          filter(category=="CBC Differential") |> 
+          pull(variable),
+        covariates = c(
+          "gli_age",
+          "gli_sex",
+          "gli_height",
+          "fis"
+        ),
+        action = "get",
+        family = "gaussian"
+    ) |> 
+  pluck("results_df") |> 
+  filter(term %in% c(
+    aw_cb |>
+          filter(category=="CBC Differential") |> 
+          pull(variable)
+  ))
+
+cell_res |> 
+  # Order categories by median effect size
+    mutate(
+        sig = p.value< 0.05,
+        term = case_when(
+          sig == TRUE ~ paste0("* ",definition),
+          .default =definition),
+        # Order terms by estimate (within categories)
+        term = forcats::fct_reorder(term, estimate)
+    ) |> 
+    ggplot(aes(x = estimate, 
+               y = term,
+               color = estimate,
+               fill = estimate)) +
+    geom_point(shape = 21, 
+               size = 2.5, 
+               stroke = 0.8) +
+    geom_errorbarh(aes(xmin = estimate - 1.96 * std.error,
+                       xmax = estimate + 1.96 * std.error),
+                   height = 0.15) +
+    scale_color_gradient2(
+        low="blue4",
+        mid="grey85",
+        high="red4",
+        midpoint = 0
+    )+
+    scale_fill_gradient2(
+        low="blue4",
+        mid="grey85",
+        high="red4",
+        midpoint = 0
+    )+
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        title = NULL,
+        x = "Effect size",
+        y = "",
+        fill ="Effect size",
+        color ="Effect size"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(panel.grid.minor = element_blank(),
+          strip.text.y = element_text(angle=0,
+                                      face="bold.italic"))
+```
+ 
+
+### Cell/Cytokines
+
+```{r}
+# Perform ExWAS Analysis
+cell_cyto_res <- expom |>
+    run_association(
+        source = "exposures",
+        outcome = "pftfev1fvc_actual",
+        feature_set = aw_cb |>
+    filter(grepl(
+      "Serum Cytokines|Nasal Cytokines|CBC Differential",category)) |> 
+    filter(variable %in% colnames(tidyexposomics::pivot_sample(expom))) |> 
+    pull(variable),
+        covariates = c(
+          "gli_age",
+          "gli_sex",
+          "gli_height",
+          "fis"
+        ),
+        action = "get",
+        family = "gaussian"
+    ) |> 
+  pluck("results_df") |> 
+  filter(term %in% c(
+    aw_cb |>
+    filter(grepl(
+      "Serum Cytokines|Nasal Cytokines|CBC Differential",category)) |> 
+    filter(variable %in% colnames(tidyexposomics::pivot_sample(expom))) |> 
+    pull(variable)
+  ))
+
+cell_cyto_res |> 
+  # Order categories by median effect size
+    mutate(
+        sig = p.value< 0.05,
+        term = case_when(
+          sig == TRUE ~ paste0("* ",term),
+          .default =term),
+        # Order terms by estimate (within categories)
+        term = forcats::fct_reorder(term, estimate),
+        category = forcats::fct_reorder(
+            category, estimate, .fun = median, .desc = TRUE),
+    ) |> 
+    ggplot(aes(x = estimate, 
+               y = term,
+               color = estimate,
+               fill = estimate)) +
+    geom_point(shape = 21, 
+               size = 2.5, 
+               stroke = 0.8) +
+    geom_errorbarh(aes(xmin = estimate - 1.96 * std.error,
+                       xmax = estimate + 1.96 * std.error),
+                   height = 0.15) +
+  ggh4x::facet_grid2(category ~ ., 
+                       scales = "free",
+                       space = "free") +
+    scale_color_gradient2(
+        low="blue4",
+        mid="grey85",
+        high="red4",
+        midpoint = 0
+    )+
+    scale_fill_gradient2(
+        low="blue4",
+        mid="grey85",
+        high="red4",
+        midpoint = 0
+    )+
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        title = NULL,
+        x = "Effect size",
+        y = "",
+        fill ="Effect size",
+        color ="Effect size"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(panel.grid.minor = element_blank(),
+          strip.text.y = element_text(angle=0,
+                                      face="bold.italic"))
+```
+
+
+## ExWAS
+
+### Covariate Inclusion
+
+```{r}
+covars <- covar_screen(
+  expom |> 
+    tidyexposomics::pivot_sample(),
+  outcome = "pftfev1fvc_actual",
+  base_covars = c(
+    "gli_age",
+    "gli_sex"),
+  candidate_covars = c(
+    "fis",
+    "black",
+    "gli_height",
+    "bmizscore",
+    "somecol",
+    "income5",
+    "season",
+    "med_ics")
+  # candidate_covars=vars[!vars %in% c(exp_vars,"gli_age","gli_sex")]
+  
+)
+
+covars$recommended_covariates
+```
+
+### FEV1 / FVC
+
+Measuring airway obstruction
+
+```{r}
+#| fig-height: 12
+#| fig-width: 5
+
+
+# Perform ExWAS Analysis
+fev1_fvc_expom <- expom |>
+    run_association(
+        source = "exposures",
+        outcome = "pftfev1fvc_actual",
+        feature_set = exp_vars,
+        covariates = c(
+          "gli_age",
+          "gli_sex",
+          "gli_height",
+          "fis"
+        ),
+        action = "add",
+        family = "gaussian"
+    )
+
+fev1_fvc_expom |>
+    plot_association(
+        subtitle = paste(
+          "Covariates: ",
+          "Age, Sex, Height, Food Insecurity"
+        ,sep = "\n"),
+        source = "exposures",
+        terms = exp_vars,
+        filter_thresh = 0.05,
+        filter_col = "p.value",
+        r2_col = "adj_r2"
+    )+
+  labs(
+    caption="P < 0.05",
+    title=NULL
+  )+
+  theme(plot.caption = element_text(face="italic"))
+```
+### Manhattan Plot 
+
+```{r}
+#| fig-width: 8
+#| fig-height: 7
+plot_manhattan(fev1_fvc_expom,
+               facet_angle = 0,
+               facet_cols = cat_colors)
+```
+
+### Group Effects
+
+```{r}
+#| fig-width: 8
+#| fig-height: 10
+assoc_df <- fev1_fvc_expom |> 
+  extract_results(result = "association") |> 
+  pluck("assoc_exposures",
+        "results_df") |> 
+  # Order categories by median effect size
+    mutate(
+        sig = p.value< 0.05,
+        term = case_when(
+          sig == TRUE ~ paste0("* ",term),
+          .default =term),
+        # Order terms by estimate (within categories)
+        term = forcats::fct_reorder(term, estimate),
+        category = forcats::fct_reorder(
+            category, estimate, .fun = median, .desc = TRUE),
+    ) 
+    # # Order categories by median effect size
+    # mutate(
+    #     category = forcats::fct_reorder(
+    #         category, estimate, .fun = median, .desc = TRUE),
+    #     
+    #     # Order terms by estimate (within categories)
+    #     term = forcats::fct_reorder(term, estimate),
+    #     
+    #     # Significance flag for fill aesthetics
+    #     sig = p_adjust < 0.05
+    # ) 
+assoc_df |> 
+    ggplot(aes(x = estimate, 
+               y = term,
+               color = estimate,
+               fill = estimate)) +
+    geom_point(shape = 21, 
+               size = 2.5, 
+               stroke = 0.8) +
+    geom_errorbarh(aes(xmin = estimate - 1.96 * std.error,
+                       xmax = estimate + 1.96 * std.error),
+                   height = 0.15) +
+    #facet_grid(category~., scales = "free",space = "free") +
+    ggh4x::facet_grid2(category ~ ., 
+                       scales = "free",
+                       space = "free", 
+                       strip = ggh4x::strip_themed(
+                           background_y = ggh4x::elem_list_rect(
+                               fill = cat_colors[levels(assoc_df$category)]))) +
+    # ggh4x::force_panelsizes(rows = c(
+    #   2,2,2,2,2,1,1,2,1,1,3,3,3
+    # )) + 
+    scale_color_gradient2(
+        low="blue4",
+        mid="grey85",
+        high="red4",
+        midpoint = 0
+    )+
+    scale_fill_gradient2(
+        low="blue4",
+        mid="grey85",
+        high="red4",
+        midpoint = 0
+    )+
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        title = NULL,
+        x = "Effect size",
+        y = "",
+        fill ="Effect size",
+        color ="Effect size"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(panel.grid.minor = element_blank(),
+          strip.text.y = element_text(angle=0,
+                                      face="bold.italic"))
+```
+
+### Stability
+
+```{r}
+exwas_stability_res <- run_exwas_sensitivity(
+    df = tidyexposomics::pivot_sample(fev1_fvc_expom),
+    exposures = exp_vars,
+    outcome = "pftfev1fvc_actual",
+    covariates = c("gli_age" , "gli_sex" , "gli_height" , "fis"),
+    covariates_to_remove = c("gli_age" , "gli_sex" , "gli_height" , "fis"),
+    family = gaussian(),
+    bootstrap_n = 100
+)
+
+sens_df <- exwas_stability_res$sensitivity_df |>
+    mutate(
+        signif = (p_value <= 0.05) ,
+        sign = sign(estimate)
+    ) %>%
+    group_by(exposure) %>%
+    summarise(
+        n_tests = n(),
+        n_signif = sum(signif, na.rm = TRUE),
+        prop_signif = n_signif / n_tests,
+        median_effect = median(estimate, na.rm = TRUE),
+        median_p=median(p_value, na.rm = TRUE),
+        sd_effect = sd(estimate, na.rm = TRUE),
+        sign_consistency =
+            ifelse(all(is.na(sign)), NA_real_,
+                   abs(sum(sign, na.rm = TRUE)) / n_tests),
+        stability_score = prop_signif * sign_consistency,
+        .groups = "drop"
+    ) |> 
+  left_join(
+    aw_cb,
+    by=c("exposure"="variable")
+  )
+
+
+```
+
+#### Forest Plot
+
+```{r}
+sens_assoc_df <- sens_df |> 
+    # Order categories by median effect size
+    mutate(
+        category = forcats::fct_reorder(
+            category, median_effect, .fun = median, .desc = TRUE),
+        
+        # Order terms by estimate (within categories)
+        exposure = forcats::fct_reorder(exposure, median_effect),
+        
+        # Significance flag for fill aesthetics
+        sig = median_p < 0.05
+    ) 
+sens_assoc_df |> 
+    ggplot(aes(x = median_effect, 
+               y = exposure,
+               color = median_effect,
+               fill = median_effect)) +
+    geom_point(shape = 21, 
+               size = 2.5, 
+               stroke = 0.8) +
+    geom_errorbarh(aes(xmin = median_effect - 1.96 * sd_effect,
+                       xmax = median_effect + 1.96 * sd_effect),
+                   height = 0.15) +
+    #facet_grid(category~., scales = "free",space = "free") +
+    ggh4x::facet_grid2(category ~ ., 
+                       scales = "free",
+                       space = "free", 
+                       strip = ggh4x::strip_themed(
+                           background_y = ggh4x::elem_list_rect(
+                               fill = cat_colors[levels(sens_assoc_df$category)]))) +
+    # ggh4x::force_panelsizes(rows = c(
+    #   2,2,2,2,2,1,1,2,1,1,3,3,3
+    # )) + 
+    scale_color_gradient2(
+        low="blue4",
+        mid="grey85",
+        high="red4",
+        midpoint = 0
+    )+
+    scale_fill_gradient2(
+        low="blue4",
+        mid="grey85",
+        high="red4",
+        midpoint = 0
+    )+
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+        title = NULL,
+        x = "Effect size",
+        y = "",
+        fill ="Effect size",
+        color ="Effect size"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(panel.grid.minor = element_blank(),
+          strip.text.y = element_text(angle=0,
+                                      face="bold.italic"))
+```
+#### Effect Consistency 
+
+```{r}
+sens_assoc_df |>
+    # mutate(exposure_ord = fct_reorder(exposure, sign_consistency)) |>
+  mutate(
+    exp_match = ifelse()
+    exposure_ord = fct_reorder(exposure,
+                                    )) |> 
+    ggplot(aes(
+        y = exposure_ord,
+        x = sign_consistency,
+        color = median_effect,
+        fill = median_effect
+    )) +
+    # stem
+    geom_segment(
+        aes(
+            x = 0,
+            xend = sign_consistency,
+            yend = exposure_ord
+        ),
+        linewidth = 0.5
+    ) +
+    # head
+    geom_point(
+        shape = 21,
+        size = 3,
+        stroke = 0.9
+    ) +
+    scale_color_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,
+        limits = c(-0.15, 0.15),
+        oob = scales::squish
+    ) +
+    scale_fill_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,
+        limits = c(-0.15, 0.15),
+        oob = scales::squish
+    ) +
+    labs(
+        x = "Effect consistency",
+        y = NULL,
+        color = "Effect size",
+        fill = "Effect size"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank()
+    )
+
+```
+
+#### Median Effect Size
+
+```{r}
+sens_assoc_df |> 
+    group_by(category) |> 
+    mutate(med_cat=mode(median_effect)) |> 
+    ungroup() |> 
+    ggplot(aes(
+        x = reorder(category,med_cat),
+        y = median_effect,
+        fill = category,
+        color = category)) +
+    geom_boxplot(outlier.shape = NA, 
+                 alpha = 0.8,
+                 color = "black",
+                 linewidth=0.005) +
+    geom_jitter(alpha=0.1)+
+    labs(
+        y = "Median Estimate",
+        x = "",
+        title = ""
+    ) +
+    scale_fill_manual(values=cat_colors)+
+    scale_color_manual(values=cat_colors)+
+    theme_classic(base_size = 12) +
+    theme(legend.position = "none")+
+    rotate_x_text(angle = 65)+
+    ylim(c(-0.04,0.04))+
+    geom_hline(yintercept = 0,
+               linetype="dashed")
+```
+
+#### Sign Flip Change
+
+```{r}
+sens_assoc_df |> 
+    group_by(category) |> 
+    mutate(med_cat=median(sign_consistency)) |> 
+    ungroup() |> 
+    ggplot(aes(
+        x = reorder(category,med_cat),
+        y = sign_consistency,
+        fill = category,
+        color = category)) +
+    geom_boxplot(outlier.shape = NA, 
+                 alpha = 0.8,
+                 color = "black",
+                 linewidth=0.005) +
+    geom_jitter(alpha=0.1)+
+    labs(
+        y = "Median Sign Consistency",
+        x = "",
+        title = ""
+    ) +
+    scale_fill_manual(values=cat_colors)+
+    scale_color_manual(values=cat_colors)+
+    theme_classic(base_size = 12) +
+    theme(legend.position = "none")+
+    rotate_x_text(angle = 65)
+    # geom_hline(yintercept = 0.5,
+    #            linetype="dashed")
+```
+
+#### Proportion Significant 
+
+```{r}
+
+```
+
+
+### Sample Size
+
+```{r}
+assoc_df <- expom |>
+    run_association(
+        source = "exposures",
+        outcome = "pftfev1fvc_actual",
+        feature_set = exp_vars,
+        action = "get",
+        family = "gaussian"
+    ) |> 
+  pluck("results_df") 
+  # df = n - (exposure + covars + intercept)
+  # mutate(df = nrow(tidyexposomics::pivot_sample()(expom)) - 2) 
+
+sample_size_results <- bind_rows(
+  calc_sample_sizes(
+  assoc_df=assoc_df,
+  sd_y = 1,
+  alpha = 0.05, 
+  power = 0.70) |> 
+    mutate(power="0.70"),
+  calc_sample_sizes(
+  assoc_df=assoc_df,
+  sd_y = 1,
+  alpha = 0.05, 
+  power = 0.80) |> 
+    mutate(power="0.80"),
+  calc_sample_sizes(
+  assoc_df=assoc_df,
+  sd_y = 1,
+  alpha = 0.05, 
+  power = 0.90) |> 
+    mutate(power="0.90")
+)
+
+sample_size_results |> 
+  ggplot(aes(
+    x = required_n,
+    y = abs(beta),
+    color = power
+  ))+
+  geom_point(alpha=0.7)+
+  geom_line(alpha=0.5)+
+  scale_x_log10(labels = scales::label_number(big.mark = ",")) +
+  theme_classic()+
+  scale_color_manual(values=c(
+    "#483d5b",
+    "#855174",
+    "#c3687a"
+  ))+
+  labs(
+    x="Sample Size",
+    y="Abs(Estimate)",
+    color="Power"
+  )
+```
+
+## Elastic Net
+
+```{r}
+set.seed(42)
+enet_res <-
+  fev1_fvc_expom |>
+  tidyexposomics::pivot_sample() |>
+  select(pftfev1fvc_actual, 
+         all_of(exp_vars), 
+         all_of(c("gli_age","gli_sex","gli_height","fis"))) |>
+  na.omit() |>
+  (\(df) {
+    
+    X <- model.matrix(
+      ~ . - pftfev1fvc_actual - 1,
+      data = df
+    )
+    
+    y <- df$pftfev1fvc_actual
+    
+    penalty <- ifelse(colnames(X) %in% exp_vars, 1, 0)
+    
+    cv.glmnet(
+      x = X,
+      y = y,
+      family = "gaussian",
+      alpha = 0.5,                 # elastic net
+      penalty.factor = penalty,
+      standardize = TRUE,
+      nfolds = 10
+    )
+  })()
+
+enet_tbl <-
+  broom::tidy(enet_res$glmnet.fit) |>
+  filter(lambda==enet_res$lambda.1se)
+```
+
+### * Forest Plot
+
+```{r}
+combo_assoc_df |>
+    ggplot(aes(x = enet_estimate,
+               y = term,
+               color = enet_estimate)) +
+    geom_segment(
+        aes(x = 0, xend = enet_estimate,
+            yend = term),
+        linewidth = 0.8
+    ) +
+    geom_point(size = 2.5) +
+    ggh4x::facet_grid2(
+        category ~ .,
+        scales = "free",
+        space = "free",
+        strip = ggh4x::strip_themed(
+            background_y = ggh4x::elem_list_rect(
+                fill = cat_colors[levels(assoc_df$category)]
+            )
+        )
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    scale_color_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,
+        limits = c(-0.15, 0.15),
+        oob = scales::squish
+    ) +
+    scale_fill_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,
+        limits = c(-0.15, 0.15),
+        oob = scales::squish
+    ) +
+    labs(x = "Elastic-net coefficient", y = NULL,,color="Effect Size") +
+    theme_bw(base_size = 13)+
+    theme(panel.grid.minor = element_blank(),
+          strip.text.y = element_text(angle = 0, face = "bold.italic"),
+          legend.position = "right")
+```
+
+
+### * Aggregate Analysis
+
+```{r}
+combo_assoc_df <- fev1_fvc_expom |> 
+  extract_results(result = "association") |> 
+  pluck("assoc_exposures",
+        "results_df") |> 
+  dplyr::select(term,
+                estimate,
+                std.error,
+                p.value,
+                category) |> 
+  left_join(sens_df |> 
+              dplyr::select(exposure,
+                            median_effect,
+                            sign_consistency),
+            by=c("term"="exposure")) |> 
+  left_join(broom::tidy(enet_res$glmnet.fit) |>
+              filter(lambda == enet_res$lambda.min,
+                     term != "(Intercept)") |> 
+              dplyr::select(term,
+                            enet_estimate=estimate)) |> 
+  mutate(
+    sig=p.value<0.05,
+    term = case_when(
+      sig == TRUE ~ paste0("* ",term),
+      .default =term),
+    term = forcats::fct_reorder(term, estimate),
+    category = forcats::fct_reorder(
+      category, estimate, .fun = median, .desc = TRUE)
+  )
+
+p_assoc <-
+  combo_assoc_df |>
+  ggplot(aes(x = estimate,
+             y = term,
+             color = estimate,
+             fill = estimate)) +
+  geom_point(shape = 21, size = 2.5, stroke = 0.8) +
+  geom_errorbarh(
+    aes(xmin = estimate - 1.96 * std.error,
+        xmax = estimate + 1.96 * std.error),
+    height = 0.15
+  ) +
+  ggh4x::facet_grid2(
+    category ~ .,
+    scales = "free",
+    space = "free",
+    strip = ggh4x::strip_themed(
+      background_y = ggh4x::elem_list_rect(
+        fill = cat_colors[levels(assoc_df$category)]
+      )
+    )
+  ) +
+  scale_color_gradient2(
+    low = "blue4", mid = "grey85", high = "red4", midpoint = 0
+  ) +
+  scale_fill_gradient2(
+    low = "blue4", mid = "grey85", high = "red4", midpoint = 0
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "Effect size", y = NULL,color="Effect Size") +
+  theme_bw(base_size = 13) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text.y = element_text(angle = 0, face = "bold.italic"),
+        legend.position = "bottom")
+
+p_stability <-
+  combo_assoc_df |>
+  ggplot(aes(x = sign_consistency,
+             y = term,
+             color = median_effect)) +
+  geom_segment(
+    aes(x = 0, xend = sign_consistency,
+        yend = term),
+    linewidth = 0.8
+  ) +
+  geom_point(size = 2.5) +
+  ggh4x::facet_grid2(
+    category ~ .,
+    scales = "free",
+    space = "free",
+    strip = ggh4x::strip_themed(
+      background_y = ggh4x::elem_list_rect(
+        fill = cat_colors[levels(assoc_df$category)]
+      )
+    )
+  ) +
+  scale_color_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,
+        limits = c(-0.15, 0.15),
+        oob = scales::squish
+    ) +
+    scale_fill_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,
+        limits = c(-0.15, 0.15),
+        oob = scales::squish
+    ) +
+  labs(x = "Effect consistency", y = NULL, color = "Median Effect") +
+  theme_bw(base_size = 13)+
+  theme(panel.grid.minor = element_blank(),
+        strip.text.y = element_text(angle = 0, face = "bold.italic"),
+        legend.position = "bottom")
+
+p_enet <-
+  combo_assoc_df |>
+  ggplot(aes(x = enet_estimate,
+             y = term,
+             color = enet_estimate)) +
+  geom_segment(
+    aes(x = 0, xend = enet_estimate,
+        yend = term),
+    linewidth = 0.8
+  ) +
+  geom_point(size = 2.5) +
+  ggh4x::facet_grid2(
+    category ~ .,
+    scales = "free",
+    space = "free",
+    strip = ggh4x::strip_themed(
+      background_y = ggh4x::elem_list_rect(
+        fill = cat_colors[levels(assoc_df$category)]
+      )
+    )
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,
+        limits = c(-0.15, 0.15),
+        oob = scales::squish
+    ) +
+    scale_fill_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,
+        limits = c(-0.15, 0.15),
+        oob = scales::squish
+    ) +
+  labs(x = "Elastic-net coefficient", y = NULL,,color="Effect Size") +
+  theme_bw(base_size = 13)+
+  theme(panel.grid.minor = element_blank(),
+        strip.text.y = element_text(angle = 0, face = "bold.italic"),
+        legend.position = "bottom")
+
+p_assoc | p_stability | p_enet
+```
+
+### * Aggregate Plot 2
+
+```{r}
+combo_assoc_df <- fev1_fvc_expom |> 
+    extract_results(result = "association") |> 
+    pluck("assoc_exposures",
+          "results_df") |> 
+    dplyr::select(term,
+                  estimate,
+                  std.error,
+                  p.value,
+                  category) |> 
+    left_join(sens_df |> 
+                filter(sign_consistency>.5) |> 
+                  dplyr::select(exposure,
+                                median_effect,
+                                sign_consistency),
+              by=c("term"="exposure")) |> 
+    left_join(broom::tidy(enet_res$glmnet.fit) |>
+                  filter(lambda == enet_res$lambda.min,
+                         term != "(Intercept)") |> 
+                  dplyr::select(term,
+                                enet_estimate=estimate)) |> 
+    mutate(
+        sig=p.value<0.05,
+        term = case_when(
+            sig == TRUE ~ paste0("* ",term),
+            .default =term),
+        term = forcats::fct_reorder(term, estimate),
+        category = forcats::fct_reorder(
+            category, estimate, .fun = median, .desc = TRUE)
+    )
+
+p_assoc <-
+    combo_assoc_df |>
+    ggplot(aes(x = estimate,
+               y = term,
+               color = estimate,
+               fill = estimate)) +
+    geom_point(shape = 21, size = 2.5, stroke = 0.8) +
+    geom_errorbarh(
+        aes(xmin = estimate - 1.96 * std.error,
+            xmax = estimate + 1.96 * std.error),
+        height = 0.15
+    ) +
+    ggh4x::facet_grid2(
+        category ~ .,
+        scales = "free",
+        space = "free",
+        strip = ggh4x::strip_themed(
+            background_y = ggh4x::elem_list_rect(
+                fill = cat_colors[levels(assoc_df$category)]
+            )
+        )
+    ) +
+    scale_color_gradient2(
+        low = "blue4", mid = "grey85", high = "red4", midpoint = 0
+    ) +
+    scale_fill_gradient2(
+        low = "blue4", mid = "grey85", high = "red4", midpoint = 0
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(x = "Effect size", y = NULL,color="Effect Size",fill="Effect Size") +
+    theme_bw(base_size = 13) +
+    theme(panel.grid.minor = element_blank(),
+          legend.position = "bottom",
+          strip.text.y = element_blank(),
+          strip.background.y = element_blank())
+
+p_stability <-
+    combo_assoc_df |>
+    ggplot(aes(x = sign_consistency,
+               y = term,
+               color = median_effect)) +
+    geom_segment(
+        aes(x = 0, xend = sign_consistency,
+            yend = term),
+        linewidth = 0.8
+    ) +
+    geom_point(size = 2.5) +
+    ggh4x::facet_grid2(
+        category ~ .,
+        scales = "free",
+        space = "free",
+        strip = ggh4x::strip_themed(
+            background_y = ggh4x::elem_list_rect(
+                fill = cat_colors[levels(assoc_df$category)]
+            )
+        )
+    ) +
+    scale_color_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,
+        limits = c(-0.15, 0.15),
+        oob = scales::squish
+    ) +
+    scale_fill_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,
+        limits = c(-0.15, 0.15),
+        oob = scales::squish
+    ) +scale_x_continuous(breaks = c(0,0.5,1))+
+    labs(x = "Effect consistency", y = NULL, color = "Median Effect") +
+    theme_bw(base_size = 13)+
+    theme(panel.grid.minor = element_blank(),
+          legend.position = "bottom",
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          strip.text.y = element_blank(),
+          strip.background.y = element_blank(),)
+
+p_enet <-
+    combo_assoc_df |>
+    ggplot(aes(x = enet_estimate,
+               y = term,
+               color = enet_estimate)) +
+    geom_segment(
+        aes(x = 0, xend = enet_estimate,
+            yend = term),
+        linewidth = 0.8
+    ) +
+    geom_point(size = 2.5) +
+    ggh4x::facet_grid2(
+        category ~ .,
+        scales = "free",
+        space = "free",
+        strip = ggh4x::strip_themed(
+            background_y = ggh4x::elem_list_rect(
+                fill = cat_colors[levels(assoc_df$category)]
+            )
+        )
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    scale_color_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,
+        limits = c(-0.05, 0.05),
+        oob = scales::squish
+    ) +
+    scale_fill_gradient2(
+        low = "blue4",
+        mid = "grey85",
+        high = "red4",
+        midpoint = 0,na.value = "white",
+        limits = c(-0.05, 0.05),
+        oob = scales::squish
+    ) +
+    labs(x = "Elastic-net coefficient", y = NULL,fill="Effect Size",color="Effect Size") +
+    theme_bw(base_size = 13)+
+    theme(panel.grid.minor = element_blank(),
+          strip.text.y = element_text(angle = 0, face = "bold.italic"),
+          legend.position = "bottom",
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank())
+
+(p_assoc | p_stability | p_enet) +
+    patchwork::plot_layout(widths = c(3, 3, 3))
+```
+### * Aggregate Plot 3
+
+```{r}
+combo_assoc_df <- fev1_fvc_expom |> 
+    extract_results(result = "association") |> 
+    pluck("assoc_exposures",
+          "results_df") |> 
+    dplyr::select(term,
+                  estimate,
+                  std.error,
+                  p.value,
+                  category) |> 
+    left_join(sens_df |> 
+                  #filter(sign_consistency>.5) |> 
+                  dplyr::select(exposure,
+                                median_effect,
+                                sign_consistency),
+              by=c("term"="exposure")) |> 
+    left_join(broom::tidy(enet_res$glmnet.fit) |>
+                  filter(lambda == enet_res$lambda.min,
+                         term != "(Intercept)") |> 
+                  dplyr::select(term,
+                                enet_estimate=estimate)) |> 
+    mutate(
+        sig=p.value<0.05,
+        term = case_when(
+            sig == TRUE ~ paste0("* ",term),
+            .default =term),
+        term = forcats::fct_reorder(term, estimate),
+        category = forcats::fct_reorder(
+            category, estimate, .fun = median, .desc = TRUE)
+    )
+
+p_assoc <-
+    combo_assoc_df |>
+    ggplot(aes(x = estimate,
+               y = term,
+               color = estimate,
+               fill = estimate)) +
+    geom_point(shape = 21, size = 2.5, stroke = 0.8) +
+    geom_errorbarh(
+        aes(xmin = estimate - 1.96 * std.error,
+            xmax = estimate + 1.96 * std.error),
+        height = 0.15
+    ) +
+    ggh4x::facet_grid2(
+        category ~ .,
+        scales = "free",
+        space = "free",
+        strip = ggh4x::strip_themed(
+            background_y = ggh4x::elem_list_rect(
+                fill = cat_colors[levels(assoc_df$category)]
+            )
+        )
+    ) +
+    scale_color_gradient2(
+        low = "blue4", mid = "grey85", high = "red4", midpoint = 0
+    ) +
+    scale_fill_gradient2(
+        low = "blue4", mid = "grey85", high = "red4", midpoint = 0
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(x = "Effect size", y = NULL,color="Effect Size",fill="Effect Size") +
+    theme_bw(base_size = 13) +
+    theme(panel.grid.minor = element_blank(),
+          legend.position = "right",
+          strip.text.y = element_blank(),
+          strip.background.y = element_blank())
+
+p_stability <-
+    combo_assoc_df |>
+    ggplot(aes(x = 1,
+               y = term,
+               color = sign_consistency)) +
+    geom_point(aes(size=sign_consistency)) +
+    ggh4x::facet_grid2(
+        category ~ .,
+        scales = "free",
+        space = "free",
+        strip = ggh4x::strip_themed(
+            background_y = ggh4x::elem_list_rect(
+                fill = cat_colors[levels(assoc_df$category)]
+            )
+        )
+    ) +
+    scale_color_gradientn(
+        colors = c(
+            "#3a1c71",
+            "#d76d77",
+            "#ffaf7b"
+        ),
+        na.value = "grey80")+
+    scale_x_continuous(breaks = c(0,0.5,1))+
+    labs(x = "Effect consistency", y = NULL, color = "Effect Consistency") +
+    theme_void(base_size = 13)+guides(size="none")+
+    theme(panel.grid.minor = element_blank(),
+          legend.position = "right",
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          strip.text.y = element_blank(),
+          strip.background.y = element_blank(),)
+
+p_enet <-
+    combo_assoc_df |>
+    ggplot(aes(x = 1,
+               y = term,
+               color = enet_estimate)) +
+    geom_point(aes(size = enet_estimate)) +
+    ggh4x::facet_grid2(
+        category ~ .,
+        scales = "free",
+        space = "free",
+        strip = ggh4x::strip_themed(
+            background_y = ggh4x::elem_list_rect(
+                fill = cat_colors[levels(assoc_df$category)]
+            )
+        )
+    ) +
+    #geom_vline(xintercept = 0, linetype = "dashed") +
+    scale_color_gradient2(
+        low = "#5D26C1",
+        mid = "grey85",
+        high = "#4BC0C8",
+        midpoint = 0,
+        limits = c(-0.05, 0.05),
+        oob = scales::squish
+    ) +
+    labs(x = "Elastic-net coefficient", y = NULL,color="Enet Effect Size") +
+    theme_void(base_size = 13)+guides(size="none")+
+    theme(panel.grid.minor = element_blank(),
+          strip.text.y = element_text(angle = 0, face = "bold.italic"),
+          legend.position = "right",
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank())
+
+(p_assoc | p_stability | p_enet) +
+    patchwork::plot_layout(widths = c(3, 1, 1),guides = "collect")
+```
+
+## Interaction Analysis
+
+```{r}
+# pairs <- combn(exp_vars, 2, simplify = FALSE)
+# 
+# meta <- tidyexposomics::pivot_sample()(fev1_fvc_expom)
+# 
+# library(furrr)
+# 
+# plan(multisession)
+# 
+# interaction_results <- future_map_dfr(
+#   pairs,
+#   ~ test_pair(meta, .x[1], .x[2]),
+#   .progress = TRUE
+# ) |> 
+#   filter(mode != "Other")
+```
+
+
+### Effect Direction Barplot
+
+```{r}
+# interaction_results |>  
+#     tabyl(effect_direction) |> 
+#   ggplot(aes(
+#     x=n,
+#     y=reorder(effect_direction   ,n),
+#     fill=effect_direction
+#   ))+
+#   geom_bar(stat ="identity",
+#            color="black",
+#            linewidth = 0.005)+
+#   ggsci::scale_fill_cosmic()+
+#   theme_classic()+
+#   labs(
+#     x="Freq.",
+#     y="",
+#     fill="Freq."
+#   )
+```
+
+### Frequent Negative interactions
+
+```{r}
+# interaction_results |>  
+#     filter(grepl("Negative", effect_direction)) |> 
+#     select(var1, var2) |> 
+#     pivot_longer(cols = everything(), values_to = "variable") |> 
+#     dplyr::count(variable, sort = TRUE) |> 
+#   slice_head(n=15) |> 
+#   ggplot(aes(
+#     x=n,
+#     y=reorder(variable,n),
+#     fill=n
+#   ))+
+#   geom_bar(stat ="identity",
+#            color="black",
+#            linewidth = 0.005)+
+#   theme_classic()+
+#   scale_fill_gradient(
+#     low = "#c31432",
+#     high = "#240b36"
+#   )+
+#   labs(
+#     x="Freq.",
+#     y="",
+#     fill="Freq."
+#   )
+```
+
+### Fill by Interaction Type
+
+```{r}
+# interaction_results|>  
+#     filter(grepl("Negative", effect_direction)) |> 
+#     pivot_longer(cols = c(var1, var2), values_to = "variable") |> 
+#     dplyr::count(variable, effect_direction) |> 
+#   group_by(variable) |> 
+#   mutate(total=sum(n)) |> 
+#   ungroup() |> 
+#   filter(variable %in% (
+#     interaction_results|>  
+#     filter(grepl("Negative", effect_direction)) |> 
+#     pivot_longer(cols = c(var1, var2), values_to = "variable") |> 
+#     dplyr::count(variable) |> 
+#       arrange(desc(n)) |> 
+#       slice_head(n=15) |>
+#       pull(variable)
+#   )) |> 
+#     ggplot(aes(y = reorder(variable,total), 
+#                x = n, 
+#                fill = effect_direction)) +
+#   geom_bar(stat ="identity",
+#            color="black",
+#            linewidth = 0.005)+
+#   ggsci::scale_fill_cosmic()+
+#   theme_classic()+
+#   labs(
+#     x="Freq.",
+#     y="",
+#     fill="Freq."
+#   )
+```
+
+### Number of Interaction Types
+
+```{r}
+# interaction_results |>  
+#     filter(grepl("Negative", effect_direction)) |> 
+#     select(var1, var2) |> 
+#     pivot_longer(cols = everything(), 
+#                  values_to = "variable") |>
+#   inner_join(aw_cb,by="variable") |> 
+#   tabyl(category) |> 
+#   arrange(desc(n)) |> 
+#   ggplot(aes(
+#     x=n,
+#     y=reorder(category   ,n),
+#     fill=category
+#   ))+
+#   geom_bar(stat ="identity",
+#            color="black",
+#            linewidth = 0.005)+
+#   scale_fill_manual( values=cat_colors)+
+#   theme_classic()+
+#   labs(
+#     x="Freq.",
+#     y="",
+#     fill="Freq."
+#   )
+```
+
+### Network Plot
+
+```{r}
+# # Build edges
+# edges <- interaction_results |>
+#     filter(grepl("Negative", effect_direction)) |>
+#     select(from = var1, to = var2, int_est)
+# 
+# # Convert to tidygraph 
+# g_tbl <- as_tbl_graph(
+#   igraph::graph_from_data_frame(
+#     edges, 
+#     directed = FALSE)) |>
+#     activate(nodes) |>
+#     left_join(aw_cb |>
+#                 select(variable, category),
+#               by = c("name" = "variable")) |>
+#     mutate(
+#         degree = centrality_degree(),      
+#         top10  = name %in% names(
+#           sort(degree, decreasing = TRUE))[1:10]
+#     )
+# 
+# # Plot
+# ggraph(g_tbl) +
+#     geom_edge_link(aes(
+#       edge_width = abs(int_est)), 
+#       alpha = 0.4, 
+#       color = "grey80") +
+#     geom_node_point(aes(
+#       size = degree, 
+#       color = category),
+#       alpha = 0.9) +
+#   geom_node_point(aes(
+#       size = degree, 
+#       color = category),
+#                   color = "black",
+#                   stroke = 0.005,
+#                   shape = 21,
+#                   fill = NA) +
+#     geom_node_label(
+#       aes(label = ifelse(top10, name, NA)),
+#       size = 3, repel = TRUE) +
+#   scale_color_manual( values=scales::alpha(get_palette("aaas",15), 0.7))+
+#     scale_size_continuous(range = c(2, 10)) +
+#     theme_void()
+```
+
+
+## WQS Regression
+
+```{r}
+# group_list <- aw_cb |> 
+#   filter(category %in% c(
+#     "Indoor Air",
+#   "Parabens",
+#   "Phenols",
+#   "Antimicrobials",
+#   
+#   "Dust Allergens",
+#   "IgE Respiratory",
+#   "IgE Superantigen",
+#   "IgE Food",
+#   
+#   "Serum Essential Metals",
+#   "Serum Non-Essential Metals",
+#   "Urine Essential Metals",
+#   "Urine Non-Essential Metals"
+#   )) |> 
+#   group_by(category) |>
+#   summarise(vars = list(variable)) |> 
+#   deframe()
+# 
+# 
+# bws_res <- map(names(group_list), ~{
+#   run_bws_group(
+#     group_name = .x,
+#     dat=fev1_fvc_expom |> 
+#       tidyexposomics::pivot_sample()(),
+#     outcome = "pftfev1fvc_actual",
+#     covariates =c(
+#       "gli_age",
+#       "gli_sex",
+#       "gli_height",
+#       "fis"
+#     ),
+#     family = "gaussian")
+# })
+```
+
+## Summary
+
+* Three clusters, identified using DIANA clustering, appear to be driven by IgE subtypes and urinary metals.
+
+* Metadata variables are highly correlated within variable subtypes. 
+
+* Age is highly correlated with spirometry metrics.
+
+* FEV1/FVC and FEV1 % Predicted are correlated with similar metrics - parental smoking, increased particulate matter, and IgE (ragweed & peanut) are associated with improved lung function and eosinophils are associated with reduced lung function. The directionality of the smoking status/particulate matter maybe explained by the fact that children of smokers are bothered by their asthma more and are using more medication.
+
+* Increased Eosinophil levels are associated with monocytye, basophil, and platelet levels, exhaled nitric oxide, and total IgE levels.
+
+## Save Data
+
+```{r}
+# Save MultiAssayExperiment Objects
+saveRDS(fev1_fvc_expom,file = "../results/exwas/fev1_fvc_expom.rds")
+
+# Save Bootstrapping Results
+saveRDS(exwas_stability_res,file =
+          "../results/exwas/exwas_stability_res.rds")
+```
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,160 @@
+library(dplyr)
+library(purrr)
+library(furrr)
+library(broom)
+library(tibble)
+
+# -------------------------------------------------------------
+# Helper: Build covariate sets (same as before)
+# -------------------------------------------------------------
+build_covariate_list <- function(covariates, covariates_to_remove = NULL) {
+  covar_list <- list("full" = covariates)
+  
+  if (!is.null(covariates_to_remove)) {
+    for (c in covariates_to_remove) {
+      reduced <- setdiff(covariates, c)
+      if (length(reduced) > 0) {
+        covar_list[[paste0("minus_", c)]] <- reduced
+      }
+    }
+  }
+  
+  covar_list
+}
+
+# -------------------------------------------------------------
+# Helper: row bootstrap
+# -------------------------------------------------------------
+bootstrap_resample <- function(df) {
+  df[sample(seq_len(nrow(df)), replace = TRUE), , drop = FALSE]
+}
+
+# -------------------------------------------------------------
+# Run one GLM (same as before)
+# -------------------------------------------------------------
+run_one_association <- function(df, exposure, outcome, covariates, family) {
+  rhs <- c(exposure, covariates) |> paste(collapse = " + ")
+  formula <- as.formula(paste(outcome, "~", rhs))
+  
+  mod <- tryCatch(glm(formula, data = df, family = family), error = function(e) NULL)
+  if (is.null(mod)) return(NULL)
+  
+  out <- broom::tidy(mod) |> filter(term == exposure)
+  if (nrow(out) == 0) return(NULL)
+  
+  tibble(
+    exposure = exposure,
+    estimate = out$estimate,
+    p_value  = out$p.value
+  )
+}
+
+# -------------------------------------------------------------
+# Stability calculation (same as before)
+# -------------------------------------------------------------
+calculate_stability <- function(sensitivity_df,
+                                pval_threshold = 0.05,
+                                logFC_threshold = 0) {
+  
+  sensitivity_df %>%
+    mutate(
+      signif = (p_value <= pval_threshold) & (abs(estimate) >= logFC_threshold),
+      sign = sign(estimate)
+    ) %>%
+    group_by(exposure) %>%
+    summarise(
+      n_tests = n(),
+      n_signif = sum(signif, na.rm = TRUE),
+      prop_signif = n_signif / n_tests,
+      mean_effect = mean(estimate, na.rm = TRUE),
+      sd_effect = sd(estimate, na.rm = TRUE),
+      sign_consistency =
+        ifelse(all(is.na(sign)), NA_real_,
+               abs(sum(sign, na.rm = TRUE)) / n_tests),
+      stability_score = prop_signif * sign_consistency,
+      .groups = "drop"
+    )
+}
+
+# -------------------------------------------------------------
+# ⭐ Parallel Sensitivity Analysis Using furrr
+# -------------------------------------------------------------
+run_exwas_sensitivity_parallel <- function(
+    df,
+    exposures,
+    outcome,
+    covariates,
+    covariates_to_remove = NULL,
+    family = gaussian(),
+    pval_threshold = 0.05,
+    logFC_threshold = 0,
+    score_quantile = 0.9,
+    bootstrap_n = 1
+) {
+  
+  covar_list <- build_covariate_list(covariates, covariates_to_remove)
+  
+  # Build computational grid (MODEL × EXPOSURE × BOOTSTRAP)
+  grid <- expand_grid(
+    bootstrap = seq_len(bootstrap_n),
+    model_name = names(covar_list),
+    exposure = exposures
+  )
+  
+  # Precompute covariate vector for each model
+  model_map <- covar_list
+  
+  # -------------------------------------------------------------
+  # ⭐ Parallel map using furrr
+  # -------------------------------------------------------------
+  results <- future_map_dfr(
+    seq_len(nrow(grid)),
+    function(i) {
+      row <- grid[i, ]
+      b <- row$bootstrap
+      exposure <- row$exposure
+      model_name <- row$model_name
+      covs <- model_map[[model_name]]
+      
+      # bootstrap resample
+      df_b <- bootstrap_resample(df)
+      
+      res <- run_one_association(
+        df = df_b,
+        exposure = exposure,
+        outcome = outcome,
+        covariates = covs,
+        family = family
+      )
+      
+      if (is.null(res)) return(NULL)
+      
+      res$model <- model_name
+      res$bootstrap <- b
+      res
+    },
+    .progress = TRUE
+  )
+  
+  # -------------------------------------------------------------
+  # Compute stability across all results
+  # -------------------------------------------------------------
+  feature_stability <- calculate_stability(
+    results,
+    pval_threshold = pval_threshold,
+    logFC_threshold = logFC_threshold
+  )
+  
+  score_thresh <- quantile(
+    feature_stability$stability_score[feature_stability$stability_score > 0],
+    score_quantile,
+    na.rm = TRUE
+  )
+  
+  list(
+    sensitivity_df = results,
+    feature_stability = feature_stability,
+    score_thresh = score_thresh,
+    stable_features = feature_stability |> filter(stability_score >= score_thresh)
+  )
+}

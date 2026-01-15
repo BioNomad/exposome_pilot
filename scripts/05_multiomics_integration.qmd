@@ -1,0 +1,235 @@
+---
+title: "Exposome AIRWAYS Analysis"
+subtitle: "Multiomics Integration"
+author: "Jason Laird"
+date: today 
+date-format: short
+engine: knitr
+execute: 
+  warning: false
+  message: false
+  cache: true
+format: 
+  html:
+    code-fold: true
+    theme: 
+      - simplex
+      - custom.scss
+    fontcolor: '#0c051a'
+---
+
+## Setup
+
+### Load Libraries
+
+```{r}
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(janitor)
+library(ggpubr)
+library(tidyexposomics)
+library(MultiAssayExperiment)
+```
+
+### Load Data
+
+```{r}
+# Codebook
+aw_cb <- readRDS("../results/input_data/aw_cb.rds")
+
+# MultiAssayExperiment Object
+fev1_fvc_expom <- readRDS("../results/deg/fev1_fvc_expom.rds")
+
+# Exposure variables
+exp_vars <- readRDS("../results/qc/exp_vars.rds")
+num_exp_vars <- readRDS("../results/qc/num_exp_vars.rds")
+
+# All variables
+vars <- aw_cb$variable |> 
+  (\(chr)chr[chr %in% colnames(colData(fev1_fvc_expom))])()
+
+```
+
+## Multi-omics Integration
+
+### FEV1/FVC
+
+#### Integration
+
+```{r}
+# Perform multi-omics integration
+fev1_fvc_expom <- fev1_fvc_expom |>
+    run_multiomics_integration(
+        method = "DIABLO",
+        n_factors = 5,
+        outcome = "pftprefev1fvc_zscore",
+        action = "add"
+    )
+```
+
+
+#### Association
+
+```{r}
+#| fig-width: 6
+#| fig-height: 10
+
+
+# Identify factors that correlate with the outcome
+fev1_fvc_expom <- fev1_fvc_expom |>
+    run_association(
+        source = "factors",
+        outcome = "pftfev1fvc_actual",
+        #feature_set = exp_vars,
+        covariates = c(
+            "gli_age",
+          "gli_sex",
+          "black",
+          "fiscat4",
+          "bmizscore",
+          "season",
+          "med_ics"
+        ),
+        action = "add",
+        family = "gaussian"
+    )
+
+# Plot the association
+fev1_fvc_expom |>
+    plot_association(
+        source = "factors",
+        subtitle = "Covariates: Age, Sex, Income",
+        filter_col = "p.value",
+        filter_thresh = 0.1,
+        r2_col = "adj_r2"
+    )
+```
+
+#### Extract Top/Shared Factor Features
+
+```{r}
+# Extract top features that contribute to a factor
+fev1_fvc_expom <- fev1_fvc_expom |>
+    extract_top_factor_features(
+        method = "percentile",
+        pval_col = "p.value",
+        pval_thresh = 0.1,
+        percentile = 0.95,
+        action = "add"
+    )
+
+fev1_fvc_expom_var_map <- fev1_fvc_expom |> 
+  extract_results(result = "multiomics_integration") |> 
+  pluck("top_factor_features") |> 
+  inner_join(fev1_fvc_expom |>
+               pivot_feature(),
+             by=c("feature"=".feature",
+                  "exp_name"=".exp_name")) |> 
+  dplyr::select(
+    feature=feature_map,
+    exp_name
+  ) |> 
+  distinct()
+
+
+```
+
+
+## Overlap w. DEGs
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+
+
+source("./get_pairwise_overlaps.R")
+
+
+deg_lst <- fev1_fvc_expom |> 
+  extract_results("differential_analysis") |> 
+  pluck("differential_abundance") |> 
+  filter(P.Value<0.05) |> 
+  (\(df)split(df,df$exp_name))() |> 
+  map(~.x |> 
+        pull(feature_map) |> 
+        unique()) 
+names(deg_lst) <- paste("DEG: ",names(deg_lst))
+
+mult_int_lst <- split(
+             fev1_fvc_expom_var_map,
+             fev1_fvc_expom_var_map$exp_name) |> 
+             map(~.x$feature)
+names(mult_int_lst) <- paste("Integration: ",names(mult_int_lst))
+
+
+c(deg_lst,mult_int_lst) |> 
+  get_pairwise_overlaps() |> 
+  tidygraph::as_tbl_graph() |> 
+  tidygraph::activate(nodes) |> 
+  mutate(status=ifelse(grepl("DEG",name),"DEG","Integration")) |> 
+  ggraph::ggraph(
+        layout = "linear",
+        circular = TRUE
+    ) +
+        ggraph::geom_edge_arc(aes(
+            color = jaccard,
+            width = log10(num_shared+1)
+        )) +
+        ggraph::geom_node_point(
+          aes(fill=status),
+          shape = 21,
+            size = 4,
+            alpha = 0.8
+        ) +
+        ggraph::geom_node_text(
+            aes(
+                label = name,
+                x = 1.1 * x,
+                y = 1.1 * y,
+                angle = ggraph::node_angle(x, y)
+            ),
+            hjust = "outward",
+            fontface = "bold.italic",
+            check_overlap = TRUE
+        ) +
+        ggraph::theme_graph() +
+        scale_fill_cosmic()+
+        ggraph::scale_edge_color_gradient2(
+            low = "blue4",
+            mid = "white",
+            high = "red4",
+            midpoint = 0.05,
+            guide = ggraph::guide_edge_colorbar()
+        ) +
+        ggplot2::coord_fixed(xlim = c(-2, 2), ylim = c(-2, 2)) +
+        ggplot2::guides(edge_width = "none") +
+        ggplot2::labs(
+            edge_color = "Jaccard Coef.",
+            fill =""
+        )
+```
+
+
+## Summary
+
+*   Only CD4+ T-cell and Adductomics components were associated with FEV1/FVC, suggesting  that these may jointly influence lung function decline.
+
+* CD4+ T-cell Isoform Integration features overlap more with CD4+ T-cell RNA integration features rather than CD4+ T-cell Isoform degs.
+
+## Save Data
+
+```{r}
+# Save MultiAssayExperiment Objects
+saveRDS(fev1_fvc_expom,file="../results/integration/fev1_fvc_expom.rds")
+
+# Save the variable map
+saveRDS(fev1_fvc_expom_var_map,file="../results/integration/fev1_fvc_expom_var_map.rds")
+```
+
+## Session Info
+
+```{r}
+sessionInfo()
+```

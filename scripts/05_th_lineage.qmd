@@ -1,0 +1,1749 @@
+---
+title: "Exposome AIRWAYS Analysis"
+subtitle: "Exposure-Omics Th Association Analysis"
+author: "Jason Laird"
+date: today 
+date-format: short
+engine: knitr
+execute: 
+  warning: false
+  message: false
+  cache: true
+format: 
+  html:
+    code-fold: true
+    theme: 
+      - simplex
+      - custom.scss
+    fontcolor: '#0c051a'
+---
+
+
+## Setup 
+
+### Load Libraries
+
+```{r}
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(janitor)
+library(ggpubr)
+library(ggsci)
+library(tidyexposomics)
+library(MultiAssayExperiment)
+library(furrr)
+library(patchwork)
+library(msigdbr)
+library(GSVA)
+
+# Source QC helper functions
+invisible(lapply(
+  list.files(
+    path = "./",
+    pattern = "*.R", full.names = TRUE
+  ),
+  source
+))
+```
+
+### Load Data
+
+```{r}
+# Codebook
+aw_cb <- readRDS("../results/input_data/aw_cb.rds")
+
+# MultiAssayExperiment Object
+fev1_fvc_expom <- readRDS("../results/sens/fev1_fvc_expom.rds")
+
+decon <- readRDS("../results/deconvolution/decon.rds")
+
+# Exposure variables
+exp_vars <- readRDS("../results/qc/exp_vars.rds")
+num_exp_vars <- readRDS("../results/qc/num_exp_vars.rds")
+
+# Load Exposure-omics association results
+exp_omics_sens_res_df <- readRDS("~/jhu/projects/exposomePilot/results/exposure_omics/exp_omics_sens_res_df.rds")
+
+# All variables
+vars <- aw_cb$variable |> 
+  (\(chr)chr[chr %in% colnames(colData(fev1_fvc_expom))])()
+
+# Setting colors for exposure categories
+cat_colors <- scales::alpha(get_palette("aaas",13), 0.5) |> 
+  (\(colors){
+    names(colors) <- aw_cb |> 
+      filter(variable %in% exp_vars) |> 
+      pull(category) |> 
+      unique()
+    colors
+  })()
+```
+
+## Th Correlation
+
+```{r}
+# prep the data
+ps <- tidybulk::pivot_sample(decon)
+
+cell_cols <- colnames(ps)[grepl("cell|T.reg", colnames(ps))]
+
+cell_mat <- ps |>
+  dplyr::select(all_of(cell_cols)) |>
+  as.matrix()
+
+# Zero handling (required for CLR)
+cell_mat[cell_mat == 0] <- 1e-6
+
+# CLR transform
+clr_mat <- compositions::clr(cell_mat)
+colnames(clr_mat) <- paste0("clr_", cell_cols)
+
+meta <- ps |>
+  dplyr::select(
+    all_of(exp_vars),
+    gli_age,
+    gli_sex,
+    gli_height,
+    fis
+  )
+
+model_df <- bind_cols(meta, as.data.frame(clr_mat))
+
+# fit the models
+decon_res <- expand_grid(
+  exposure = exp_vars,
+  clr_col  = colnames(clr_mat)
+) |>
+  mutate(
+    model = map2(
+      exposure,
+      clr_col,
+      ~ {
+        fml <- as.formula(paste(
+          .x,
+          "~",
+          .y,
+          "+ gli_age + gli_sex + gli_height + fis"
+        ))
+        lm(fml, data = model_df)
+      }
+    )
+  ) |>
+  mutate(
+    tidy = map(model, tidy)
+  ) |>
+  unnest(tidy) |>
+  filter(term == clr_col) |>
+  mutate(
+    cell = sub("^clr_", "", clr_col)
+  ) |>
+  select(
+    exposure,
+    cell,
+    estimate,
+    std.error,
+    statistic,
+    p.value
+  )
+
+# clean the labels
+decon_res <- decon_res |>
+  mutate(
+    cell_clean = case_when(
+      cell == "Memory.CD4.T.cell.TFH"               ~ "Tfh (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th1"               ~ "Th1 (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th2"               ~ "Th2 (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th17"              ~ "Th17 (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th1.Th17"          ~ "Th1/Th17 (memory CD4)",
+      cell == "Terminal.effector.memory.CD4.T.cell" ~ "Terminal effector memory CD4",
+      cell == "naive.CD4.T.cell"                    ~ "Naive CD4",
+      cell == "T.reg"                               ~ "Treg",
+      TRUE                                          ~ cell
+    )
+  )
+
+# adjust p-values
+decon_res <- decon_res |>
+  group_by(exposure) |>
+  mutate(fdr = p.adjust(p.value, method = "fdr")) |>
+  ungroup()
+```
+
+### Th Association Stability
+
+```{r}
+# base data
+stability_df <- bind_cols(
+  tidybulk::pivot_sample(decon),
+  as.data.frame(clr_mat)
+)
+
+# run sensitivity for each CLR cell outcome
+th_stability_res <- map(
+  colnames(clr_mat),
+  ~ {
+    run_exwas_sensitivity(
+      df = stability_df,
+      exposures = exp_vars,
+      outcome = .x,
+      covariates = c("gli_age", "gli_sex", "gli_height", "fis"),
+      covariates_to_remove = c("gli_age", "gli_sex", "gli_height", "fis"),
+      family = gaussian(),
+      bootstrap_n = 100
+    )$sensitivity_df |>
+      mutate(
+        clr_col = .x,
+        cell = sub("^clr_", "", .x)
+      )
+  }
+) |> 
+  bind_rows()
+
+# summarise stability (mirrors your EXWAS logic)
+th_stability_df <- th_stability_res |>
+  mutate(
+    signif = (p_value <= 0.05),
+    sign = sign(estimate)
+  ) |>
+  group_by(exposure, cell) |>
+  summarise(
+    n_tests = n(),
+    n_signif = sum(signif, na.rm = TRUE),
+    prop_signif = n_signif / n_tests,
+    median_effect = median(estimate, na.rm = TRUE),
+    median_p = median(p_value, na.rm = TRUE),
+    sd_effect = sd(estimate, na.rm = TRUE),
+    sign_consistency =
+      ifelse(all(is.na(sign)), NA_real_,
+             abs(sum(sign, na.rm = TRUE)) / n_tests),
+    stability_score = prop_signif * sign_consistency,
+    .groups = "drop"
+  ) |>
+  mutate(
+    cell_clean = case_when(
+      cell == "Memory.CD4.T.cell.TFH"               ~ "Tfh (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th1"               ~ "Th1 (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th2"               ~ "Th2 (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th17"              ~ "Th17 (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th1.Th17"          ~ "Th1/Th17 (memory CD4)",
+      cell == "Terminal.effector.memory.CD4.T.cell" ~ "Terminal effector memory CD4",
+      cell == "naive.CD4.T.cell"                    ~ "Naive CD4",
+      cell == "T.reg"                               ~ "Treg",
+      TRUE                                          ~ cell
+    )
+  ) |> 
+  left_join(
+    decon_res,
+    by=c(
+      "cell_clean"="cell_clean",
+      "cell"="cell",
+      "exposure"="exposure"
+    )
+  )
+
+
+```
+
+
+###  Heatmap
+
+```{r}
+th_stability_df |>
+    group_by(exposure) |>
+  mutate(med=mean(estimate)) |> 
+  ungroup() |> 
+  mutate(p_lab=ifelse(p.value<0.1,"lab",NA)) |> 
+    mutate(
+        exposure=fct_reorder(exposure,med),
+        cell_clean=fct_reorder(cell_clean,-med)) |> 
+    ggplot(aes(
+        x = cell_clean,
+        y = exposure,
+        fill = estimate
+    )) +
+    geom_tile(color = "grey90") +
+    scale_fill_gradient2(
+        low = "#1D2671",
+        mid = "white",
+        high = "#C33764",
+        midpoint = 0,limits=c(-.3,.3),oob=scales::squish
+    ) +
+    theme_bw() +
+    theme(
+        axis.text.x = element_text(angle = 90, hjust = 1,vjust = .35),
+        axis.text.y = element_text(),
+        legend.position = "right"
+    ) +
+    labs(
+        x = "",
+        y = "",
+        fill = "Estimate"
+    )
+```
+
+### * Full Heatmap
+
+```{r}
+th_stability_df |>
+    group_by(exposure) |>
+    mutate(
+        med   = mean(estimate),
+        n_sig = sum(p.value < 0.05)
+    ) |>
+    ungroup() |>
+    group_by(cell_clean) |>
+    mutate(
+        n_sig_cell = sum(p.value < 0.05)
+    ) |>
+    ungroup() |>
+    mutate(
+        exposure   = forcats::fct_reorder(exposure, med),
+        cell_clean = forcats::fct_reorder(cell_clean, -n_sig_cell),
+        sig        = p.value < 0.05
+    ) |>
+    (\(df) {
+        
+        ## ---- HEATMAP ---------------------------------------------------------
+        p_heat <-
+            ggplot(df, aes(
+                x = cell_clean,
+                y = exposure,
+                fill = estimate
+            )) +
+            geom_tile(color = "grey90") +
+            geom_point(
+                data = \(d) d |> filter(sig),
+                color = "black",
+                size = 1.8
+            ) +
+            scale_fill_gradient2(
+                low = "#1D2671",
+                mid = "white",
+                high = "#C33764",
+                midpoint = 0,
+                limits = c(-0.3, 0.3),
+                oob = scales::squish
+            ) +
+            scale_x_discrete(expand = c(0, 0)) +   ## <<< FIX
+            theme_bw() +
+            theme(
+                axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.35),
+                legend.position = "bottom"
+            ) +
+            labs(x = "", y = "", fill = "Estimate")
+        
+        ## ---- RIGHT BAR -------------------------------------------------------
+        p_bar_right <-
+            ggplot(
+                distinct(df, exposure, n_sig),
+                aes(x = n_sig, y = exposure)
+            ) +
+            geom_col(fill = "grey30") +
+            theme_classic() + scale_x_continuous(breaks = c(0,1,2))+
+            theme(
+                axis.text.y = element_blank(),
+                axis.ticks.y = element_blank()
+            ) +
+            labs(x = "", y = "")
+        
+        ## ---- TOP BAR ---------------------------------------------------------
+        p_bar_top <-
+            ggplot(
+                distinct(df, cell_clean, n_sig_cell),
+                aes(x = cell_clean, y = n_sig_cell)
+            ) +
+            geom_col(fill = "grey30") +
+            theme_classic() +
+            theme(
+                axis.text.x  = element_blank(),
+                axis.ticks.x = element_blank(),
+            ) +
+            labs(x = "", y = "")
+        
+        ## ---- COMPOSE ---------------------------------------------------------
+        top    <- (p_bar_top | plot_spacer()) +
+            plot_layout(widths = c(3, 1))            ## <<< FIX
+        
+        bottom <- (p_heat | p_bar_right) +
+            plot_layout(widths = c(4, 1))            ## <<< FIX
+        
+        top / bottom +
+            plot_layout(heights = c(1, 12))
+    })()
+
+```
+
+### * Exposures Barplot
+
+```{r}
+th_stability_df |> 
+  filter(sign_consistency>0.7) |> 
+    group_by(exposure) |>
+    reframe(nsig=sum(p.value<0.05),
+            med=median(abs(estimate)))|> 
+    filter(nsig>0) |> 
+    ggplot(aes(
+        x=med,
+        y=reorder(exposure,med),
+        fill=med
+    ))+
+    # geom_point()+
+    # geom_segment(aes(
+    #     x=0,
+    #     xend=med,
+    #     y=exposure
+    # ))+
+  geom_col(color="black",linewidth = 0.005)+
+    scale_fill_gradientn(
+        colors = c(
+            "#3a1c71",
+            "#d76d77"
+        ),
+        na.value = "grey80")+
+    theme_classic()+
+  scale_x_continuous(
+    breaks = c(0,.1,.2)
+  )+
+    labs(
+        x="Median |Estimate|",
+        y="",
+        fill="Median |Estimate|"
+    )
+```
+
+### * Th Barplot
+
+```{r}
+th_stability_df |>
+    filter(p.value<0.1,
+           sign_consistency>0.7) |>
+    group_by(cell_clean) |> 
+    reframe(med=median(estimate)) |>
+    ggplot(aes(
+        x = med,
+        y = fct_reorder(cell_clean,med),
+        fill = med
+    )) +
+    geom_col(color = "black", 
+             linewidth = 0.005) +
+    theme_bw() +
+    scale_fill_gradient2(
+        low ="blue4",
+        mid="white",
+        high = "red4",
+        midpoint = 0
+    )+scale_x_continuous(breaks = c(-1,-.5,.1))+
+    labs(x = "",
+         y = "", 
+         fill = "Median Estimate") +
+    theme(
+        strip.text.x = element_text(
+            face = "bold.italic"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor   = element_blank(),
+        legend.position = "right",
+        legend.title.position = "top"
+    )
+```
+### * Th Barplot Thresholds
+
+```{r}
+pmap(
+  expand_grid(
+    consistency = c(0.3, 0.5, 0.7, 0.9),
+    p_cutoff    = c(0.1, 0.05)
+),
+    \(consistency,p_cutoff){
+      th_stability_df |>
+    filter(p.value<p_cutoff,
+           sign_consistency>consistency) |>
+    group_by(cell_clean) |> 
+    reframe(med=median(estimate),
+            n=n(),
+            cell_clean=paste(cell_clean," (",n,")",sep="")) |> 
+        distinct() |> 
+        (\(df){
+        df |> 
+            ggplot(aes(
+                x = med,
+                y = fct_reorder(cell_clean,med),
+                fill = med
+            )) +
+            geom_col(color = "black", 
+                     linewidth = 0.005) +
+            theme_bw() +
+            scale_fill_gradient2(
+                low ="blue4",
+                mid="white",
+                high = "red4",
+                midpoint = 0
+            )+
+        scale_x_continuous(breaks = c(-1,-.5,.1))+
+            labs(x = "",title="Th-Exposures",
+                 y = "", 
+                 caption=paste("P <",p_cutoff, "& Effect Consistency >",consistency*100,"%"),
+                 fill = "Median Estimate") +
+            theme(
+                strip.text.x = element_text(
+                    face = "bold.italic"),
+                panel.grid.major.x = element_blank(),
+                panel.grid.minor   = element_blank(),
+                legend.position = "right",
+                legend.title.position = "top",
+                plot.title = element_text(
+                  size=12
+                )
+            ) })()
+    }) |> 
+  wrap_plots(ncol = 2)
+
+th_stability_df |>
+    filter(p.value<0.1,
+           sign_consistency>0.9) |>
+    group_by(cell_clean) |> 
+    reframe(med=median(estimate)) |> (\(df){
+        df |> 
+            ggplot(aes(
+                x = med,
+                y = fct_reorder(cell_clean,med),
+                fill = med
+            )) +
+            geom_col(color = "black", 
+                     linewidth = 0.005) +
+            theme_bw() +
+            scale_fill_gradient2(
+                low ="blue4",
+                mid="white",
+                high = "red4",
+                midpoint = 0
+            )+scale_x_continuous(breaks = c(-1,-.5,.1))+
+            labs(x = "",title="Th-Exposures", 
+                 subtitle = paste("N:", nrow(th_stability_df |>
+                                                 filter(p.value<0.1,
+                                                        sign_consistency>0.9))," Exposures"),
+                 y = "", caption="P < 0.1 & Effect Consistency > 90%",
+                 fill = "Median Estimate") +
+            theme(
+                strip.text.x = element_text(
+                    face = "bold.italic"),
+                panel.grid.major.x = element_blank(),
+                panel.grid.minor   = element_blank(),
+                legend.position = "right",
+                legend.title.position = "top"
+            ) })()
+    
+```
+
+
+### * Heatmap
+
+```{r}
+th_stability_df |>
+    filter(p.value<0.1,
+           sign_consistency>0.7) |> 
+    mutate(
+        exposure=fct_reorder(exposure,estimate),
+        cell_clean=fct_reorder(cell_clean,estimate),
+    ) |>
+    ggplot(
+        aes(
+            x = cell_clean,
+            y = exposure,
+            fill = estimate
+        )
+    ) +
+    geom_tile(
+        color = "black",
+        linewidth = 0.2,
+        height = 0.9
+    ) +
+    scale_fill_gradient2(
+        low ="blue4",
+        mid="white",
+        high = "red4",
+        midpoint = 0,
+        limits=c(-0.2,.2),
+        oob=scales::squish
+    )+
+    labs(
+        x = "",
+        y = "",
+        fill = "Estimate"
+    ) +
+    theme_bw() +
+    theme(
+        # rotate labels
+        axis.text.x = element_text(
+            angle = 90,
+            vjust = 0.5,
+            hjust = 1
+        ),
+        
+        # remove x-axis formatting
+        axis.title.x = element_blank(),
+        axis.line.x  = element_blank(),
+        
+        axis.text.y = element_text(size = 9),
+        legend.position = "right",
+        legend.title.position = "top"
+    )
+# th_stability_df |>
+#   filter(p.value<0.1,
+#          sign_consistency>0.7) |> 
+#     inner_join(
+#         path_stability_df |> 
+#           filter(p.value<0.1,
+#                  sign_consistency>0.7) |> 
+#           janitor::tabyl(exposure),
+#         by = "exposure"
+#     ) |>
+#     mutate(
+#         exposure_label = if_else(
+#             n > 1,
+#             paste0(strrep("*", n), " ", exposure),
+#             exposure
+#         ),
+#         exposure_label=fct_reorder(exposure_label,estimate),
+#         cell_clean=fct_reorder(cell_clean,estimate),
+#     ) |>
+#   ggplot(
+#         aes(
+#             x = cell_clean,
+#             y = exposure_label,
+#             fill = estimate
+#         )
+#     ) +
+#     geom_tile(
+#         color = "black",
+#         linewidth = 0.2,
+#         height = 0.9
+#     ) +
+#     scale_fill_gradient2(
+#                 low ="blue4",
+#                 mid="white",
+#                 high = "red4",
+#                 midpoint = 0,
+#                 limits=c(-0.2,.2),
+#                 oob=scales::squish
+#             )+
+#     labs(
+#         x = "",
+#         y = "",
+#         fill = "Estimate",
+#         caption = "* Appears in more than one phenotype."
+#     ) +
+#     theme_bw() +
+#     theme(
+#         # rotate labels
+#         axis.text.x = element_text(
+#             angle = 90,
+#             vjust = 0.5,
+#             hjust = 1
+#         ),
+#         
+#         # remove x-axis formatting
+#         axis.title.x = element_blank(),
+#         axis.line.x  = element_blank(),
+#         
+#         axis.text.y = element_text(size = 9),
+#         legend.position = "right",
+#         legend.title.position = "top"
+#     )
+```
+
+### Cell Summary
+
+```{r}
+th_stability_df |> 
+  filter(sign_consistency>0.7) |> 
+    group_by(cell_clean) |>
+    reframe(nsig=sum(p.value<0.05),
+            mean_effect_up=median(estimate[estimate>0]),
+            mean_effect_down=median(estimate[estimate<0]),
+            med=median(estimate))|> 
+    filter(nsig>0) |> 
+    mutate(cell_clean=fct_reorder(cell_clean,med)) |> 
+    (\(df) {
+        heat <- df |> 
+            ggplot(aes(
+                x=1,
+                y=cell_clean,
+                fill=med
+            ))+
+            geom_tile()+
+            theme_bw()+
+            labs(
+                x="",
+                y="",
+                fill="Median Estimate"
+            )+
+            scale_fill_gradient2(
+                low ="blue4",
+                mid="white",
+                high = "red4",
+                midpoint = 0
+            )+
+            theme(axis.text.x = element_blank(),
+                  axis.ticks.x = element_blank(),
+                  legend.position = "bottom",
+                  legend.title.position = "top")
+        
+        bar <- df |> 
+            ggplot(aes(
+                x=nsig,
+                y=cell_clean
+            ))+
+            geom_col(fill="grey25")+
+            theme_classic()+
+            labs(
+                x="No. of Sig. Associations",
+                y=""
+            )+
+            theme(axis.text.y = element_blank(),
+                  axis.ticks.y = element_blank())
+        
+        (heat|bar)+plot_layout(
+            widths = c(1,3),
+            guides = "collect")
+    })()
+    
+```
+
+### Flipped
+
+```{r}
+decon_res |> 
+    group_by(cell_clean) |>
+    reframe(nsig=sum(p.value<0.05),
+            mean_effect_up=median(estimate[estimate>0]),
+            mean_effect_down=median(estimate[estimate<0]),
+            med=median(estimate))|> 
+    filter(nsig>0) |> 
+    mutate(cell_clean=fct_reorder(cell_clean,med)) |> 
+    (\(df) {
+        heat <- df |> 
+            ggplot(aes(
+                y=1,
+                x=cell_clean,
+                fill=med
+            ))+
+            geom_tile()+
+            theme_bw()+
+            labs(
+                x="",
+                y="",
+                fill="Median Estimate"
+            )+
+            scale_fill_gradient2(
+                low ="blue4",
+                mid="white",
+                high = "red4",
+                midpoint = 0
+            )+
+            theme(axis.text.y = element_blank(),
+                  axis.ticks.y = element_blank(),
+                  axis.text.x = element_text(
+                      angle=90,
+                      hjust = 1,vjust = .3
+                  ))
+        
+        bar <- df |> 
+            ggplot(aes(
+                y=nsig,
+                x=cell_clean
+            ))+
+            geom_col(fill="grey25")+
+            theme_classic()+
+            labs(
+                y="No. of Sig. Associations",
+                x=""
+            )+
+            theme(axis.text.x = element_blank(),
+                  axis.ticks.x = element_blank())
+        
+        (bar/heat)+plot_layout(
+            heights = c(2,1),
+            guides = "collect")
+    })()
+```
+## Pathway Associations
+
+### Extract SEs
+
+```{r}
+cd4_se <- tidyexposomics:::.update_assay_colData(
+  fev1_fvc_expom,
+  "CD4 T cell RNA") |> 
+  (\(se){
+    assay(se,"log") <- log2(assay(se,"counts")+1);
+    se
+  })()
+
+
+cd16_se <- tidyexposomics:::.update_assay_colData(
+  fev1_fvc_expom,
+  "CD16 Monocyte RNA") |> 
+  (\(se){
+    assay(se,"log") <- log2(assay(se,"counts")+1);
+    se
+  })()
+```
+
+### Extract Genesets
+
+```{r}
+msig_c5 <- msigdbr(
+    species = "Homo sapiens",
+    category = "C5"
+)
+
+gene_sets <- list(
+  # activation
+  "Monocyte Activation" =  msig_c5 |> 
+    filter(gs_name == "GOBP_MONOCYTE_ACTIVATION") |> 
+    pull(gene_symbol),
+  "T cell Activation" =  msig_c5 |> 
+    filter(gs_name == "GOBP_T_CELL_ACTIVATION") |> 
+    pull(gene_symbol),
+  
+  # chemotaxis
+  "Monocyte Chemotaxis" =  msig_c5 |> 
+    filter(gs_name == "GOBP_MONOCYTE_CHEMOTAXIS") |> 
+    pull(gene_symbol),
+  "T cell Chemotaxis" =  msig_c5 |> 
+    filter(gs_name == "GOBP_T_CELL_CHEMOTAXIS") |> 
+    pull(gene_symbol),
+  
+  # tolerance/exhaustion
+  "Tolerance" =  msig_c5 |> 
+    filter(gs_name == "GOBP_TOLERANCE_INDUCTION") |> 
+    pull(gene_symbol),
+  
+  # senescence
+  "Senescence" =  msig_c5 |> 
+    filter(gs_name == "GOBP_CELLULAR_SENESCENCE") |> 
+    pull(gene_symbol)
+
+  
+)
+
+```
+
+### GSVA Dfs
+
+```{r}
+cd4_mat <- cd4_se |>
+  pivot_se() |>
+  dplyr::select(.sample, gene_name, log) |>
+  pivot_wider(
+    names_from  = gene_name,
+    values_from = log,
+    values_fn   = mean
+  ) |>
+  column_to_rownames(".sample") |>
+  as.matrix()
+
+cd16_mat <- cd16_se |>
+  pivot_se() |>
+  dplyr::select(.sample, gene_name, log) |>
+  pivot_wider(
+    names_from  = gene_name,
+    values_from = log,
+    values_fn   = mean
+  ) |>
+  column_to_rownames(".sample") |>
+  as.matrix()
+
+cd4_gsva_par <- gsvaParam(
+  t(cd4_mat),            # matrix: samples x genes
+  gene_sets,         # list of gene sets
+  #method = "ssgsea",   # or "gsva", "zscore", "plage"
+  kcdf = "Gaussian",   # use "Gaussian" for log-transformed RNA-seq data
+  absRanking = TRUE    # use original ssGSEA normalization
+)
+
+cd16_gsva_par <- gsvaParam(
+  t(cd16_mat),            # matrix: samples x genes
+  gene_sets,         # list of gene sets
+  #method = "ssgsea",   # or "gsva", "zscore", "plage"
+  kcdf = "Gaussian",   # use "Gaussian" for log-transformed RNA-seq data
+  absRanking = TRUE    # use original ssGSEA normalization
+)
+
+cd4_gsva_df <- gsva(cd4_gsva_par) |> 
+  t() |> 
+  as.data.frame() |> 
+  rownames_to_column(".sample") |> 
+  dplyr::select(-c("Monocyte Activation",
+                   "Monocyte Chemotaxis")) |> 
+  dplyr::rename( "T cell Senescence"=Senescence,
+               "T cell Tolerance"=Tolerance)
+
+cd16_gsva_df <- gsva(cd16_gsva_par) |> 
+  t() |> 
+  as.data.frame() |> 
+  rownames_to_column(".sample") |> 
+  dplyr::select(-c("T cell Activation",
+                   "T cell Chemotaxis")) |> 
+  dplyr::rename( "Monocyte Senescence"=Senescence,
+               "Monocyte Tolerance"=Tolerance)
+
+gsva_df <- cd4_gsva_df |> 
+  inner_join(cd16_gsva_df,
+             by=".sample") |> 
+  left_join(
+    cd16_se |>
+      tidybulk::pivot_sample(),
+    by = ".sample"
+  )
+```
+
+### Assocation Testing
+
+```{r}
+# build all pathway × exposure combinations
+gsva_grid <- expand_grid(
+  gsva_pathway = setdiff(
+  names(gsva_df),
+  names(tidybulk::pivot_sample(cd4_se))
+),
+  exposure     = exp_vars
+)
+
+# fit models
+gsva_res <- gsva_grid |>
+  mutate(
+    model = map2(
+      gsva_pathway,
+      exposure,
+      ~ {
+        fml <- as.formula(paste(
+          "`",
+          .x,
+          "`~",
+          "`", .y, "` + gli_age + gli_sex + gli_height + fis",
+          sep = ""
+        ))
+        glm(fml, data = gsva_df)
+      }
+    ),
+    tidy = map(model, tidy)
+  ) |>
+  unnest(tidy) |>
+  filter(term == exposure) |>
+  select(
+    pathway = gsva_pathway,
+    exposure,
+    estimate,
+    std.error,
+    statistic,
+    p.value
+  )
+```
+
+### Stability
+
+```{r}
+# run sensitivity for each pathway
+paths <- setdiff(
+  names(gsva_df),
+  names(tidybulk::pivot_sample(cd4_se))
+)
+paths <- gsub(" ","_",paths)
+
+colnames(gsva_df) <- gsub(" ","_",colnames(gsva_df))
+
+plan(multisession)
+
+path_stability_res <- future_map(
+  paths,
+  ~ {
+    run_exwas_sensitivity(
+      df = gsva_df,
+      exposures = exp_vars,
+      outcome = .x,
+      covariates = c("gli_age", "gli_sex", "gli_height", "fis"),
+      covariates_to_remove = c("gli_age", "gli_sex", "gli_height", "fis"),
+      family = gaussian(),
+      bootstrap_n = 100
+    )$sensitivity_df |>
+      mutate(
+        pathway = .x
+      )
+  },.options = furrr_options(seed = 123)
+) |> 
+  bind_rows()
+
+# summarise stability (mirrors your EXWAS logic)
+path_stability_df <- path_stability_res |>
+  mutate(
+    signif = (p_value <= 0.05),
+    sign = sign(estimate)
+  ) |>
+  group_by(exposure, pathway) |>
+  summarise(
+    n_tests = n(),
+    n_signif = sum(signif, na.rm = TRUE),
+    prop_signif = n_signif / n_tests,
+    median_effect = median(estimate, na.rm = TRUE),
+    median_p = median(p_value, na.rm = TRUE),
+    sd_effect = sd(estimate, na.rm = TRUE),
+    sign_consistency =
+      ifelse(all(is.na(sign)), NA_real_,
+             abs(sum(sign, na.rm = TRUE)) / n_tests),
+    stability_score = prop_signif * sign_consistency,
+    .groups = "drop"
+  ) |> 
+  mutate(pathway = gsub("_"," ",pathway)) |> 
+  left_join(
+    gsva_res,
+    by=c(
+      "pathway"="pathway",
+      "exposure"="exposure"
+    )
+  )
+```
+
+### * Heatmap
+
+```{r}
+path_stability_df |>
+  filter(p.value<0.1,
+         sign_consistency>0.7) |> 
+    mutate(
+        exposure=fct_reorder(exposure,estimate),
+        pathway=fct_reorder(pathway,estimate),
+    ) |>
+  ggplot(
+        aes(
+            x = pathway,
+            y = exposure,
+            fill = estimate
+        )
+    ) +
+    geom_tile(
+        color = "black",
+        linewidth = 0.2,
+        height = 0.9
+    ) +
+    scale_fill_gradient2(
+                low ="blue4",
+                mid="white",
+                high = "red4",
+                midpoint = 0,
+                limits=c(-0.2,.2),
+                oob=scales::squish
+            )+
+    labs(
+        x = "",
+        y = "",
+        fill = "Estimate"
+    ) +
+    theme_bw() +
+    theme(
+        # rotate labels
+        axis.text.x = element_text(
+            angle = 90,
+            vjust = 0.5,
+            hjust = 1
+        ),
+        
+        # remove x-axis formatting
+        axis.title.x = element_blank(),
+        axis.line.x  = element_blank(),
+        
+        axis.text.y = element_text(size = 9),
+        legend.position = "right",
+        legend.title.position = "top"
+    )
+# path_stability_df |>
+#   filter(p.value<0.1,
+#          sign_consistency>0.7) |> 
+#     inner_join(
+#         path_stability_df |> 
+#           filter(p.value<0.1,
+#                  sign_consistency>0.7) |> 
+#           janitor::tabyl(exposure),
+#         by = "exposure"
+#     ) |>
+#     mutate(
+#         exposure_label = if_else(
+#             n > 1,
+#             paste0(strrep("*", n), " ", exposure),
+#             exposure
+#         ),
+#         exposure_label=fct_reorder(exposure_label,estimate),
+#         pathway=fct_reorder(pathway,estimate),
+#     ) |>
+#   ggplot(
+#         aes(
+#             x = pathway,
+#             y = exposure_label,
+#             fill = estimate
+#         )
+#     ) +
+#     geom_tile(
+#         color = "black",
+#         linewidth = 0.2,
+#         height = 0.9
+#     ) +
+#     scale_fill_gradient2(
+#                 low ="blue4",
+#                 mid="white",
+#                 high = "red4",
+#                 midpoint = 0,
+#                 limits=c(-0.2,.2),
+#                 oob=scales::squish
+#             )+
+#     labs(
+#         x = "",
+#         y = "",
+#         fill = "Estimate",
+#         caption = "* Appears in more than one phenotype."
+#     ) +
+#     theme_bw() +
+#     theme(
+#         # rotate labels
+#         axis.text.x = element_text(
+#             angle = 90,
+#             vjust = 0.5,
+#             hjust = 1
+#         ),
+#         
+#         # remove x-axis formatting
+#         axis.title.x = element_blank(),
+#         axis.line.x  = element_blank(),
+#         
+#         axis.text.y = element_text(size = 9),
+#         legend.position = "right",
+#         legend.title.position = "top"
+#     )
+```
+
+### * Exposure Barplot
+
+```{r}
+path_stability_df |>
+    filter(p.value<0.1,
+           sign_consistency>0.7) |>
+    group_by(exposure) |> 
+    reframe(med=median(estimate)) |>
+    ggplot(aes(
+        x = med,
+        y = fct_reorder(exposure,med),
+        fill = med
+    )) +
+    geom_col(color = "black", 
+             linewidth = 0.005) +
+    theme_bw() +
+    scale_fill_gradient2(
+        low ="blue4",
+        mid="white",
+        high = "red4",
+        midpoint = 0
+    )+scale_x_continuous(breaks = c(-1,-.5,.1))+
+    labs(x = "",
+         y = "", 
+         fill = "Median Estimate") +
+    theme(
+        strip.text.x = element_text(
+            face = "bold.italic"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor   = element_blank(),
+        legend.position = "right",
+        legend.title.position = "top"
+    )
+```
+### * Pathway Barplot
+
+```{r}
+path_stability_df |>
+    filter(p.value<0.1,
+           sign_consistency>0.7) |>
+  group_by(pathway) |> 
+  reframe(med=median(estimate)) |>
+  ggplot(aes(
+    x = med,
+    y = fct_reorder(pathway,med),
+    fill = med
+  )) +
+  geom_col(color = "black", 
+           linewidth = 0.005) +
+  theme_bw() +
+  scale_fill_gradient2(
+                low ="blue4",
+                mid="white",
+                high = "red4",
+                midpoint = 0
+            )+
+  labs(x = "",
+       y = "", 
+       fill = "Median Estimate") +
+  theme(
+    strip.text.x = element_text(
+      face = "bold.italic"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    legend.position = "bottom",
+    legend.title.position = "top"
+  )
+```
+
+### * Pathway Barplot Thresholds
+
+```{r}
+
+pmap(
+  expand_grid(
+    consistency = c(0.3, 0.5, 0.7, 0.9),
+    p_cutoff    = c(0.1, 0.05)
+),
+    \(consistency,p_cutoff){
+      path_stability_df |>
+    filter(p.value<p_cutoff,
+           sign_consistency>consistency) |>
+    group_by(pathway) |> 
+    reframe(med=median(estimate),
+            n=n(),
+            pathway=paste(pathway," (",n,")",sep="")) |> 
+        distinct() |> 
+        (\(df){
+        df |> 
+            ggplot(aes(
+                x = med,
+                y = fct_reorder(pathway,med),
+                fill = med
+            )) +
+            geom_col(color = "black", 
+                     linewidth = 0.005) +
+            theme_bw() +
+            scale_fill_gradient2(
+                low ="blue4",
+                mid="white",
+                high = "red4",
+                midpoint = 0
+            )+
+        scale_x_continuous(breaks = c(-1,-.5,.1))+
+            labs(x = "",title="Cell State-Exposures",
+                 y = "", 
+                 caption=paste("P <",p_cutoff, "& Effect Consistency >",consistency*100,"%"),
+                 fill = "Median Estimate") +
+            theme(
+                strip.text.x = element_text(
+                    face = "bold.italic"),
+                panel.grid.major.x = element_blank(),
+                panel.grid.minor   = element_blank(),
+                legend.position = "right",
+                legend.title.position = "top",
+                plot.title = element_text(
+                  size=12
+                )
+            ) })()
+    }) |> 
+  wrap_plots()
+
+    
+```
+
+## By Cell Marker - Senescence and Exhaustion/Tolerance
+
+```{r}
+gene_sets <- list(
+  tcell_exhaustion   = c(
+    "TIGIT",
+    "PDCD1",
+    "CTLA4",
+    "LAG3",
+    "HAVCR2",
+    "ENTPD1",
+    "CD244",
+    "TOX",
+    "TOX2",
+    "NR4A1",
+    "NR4A2",
+    "BATF",
+    "IRF4"
+  ),
+  endotoxin_tolerance = c(
+    "LILRB1",
+    "LILRB2",
+    "LILRB4",
+    "CD274",
+    "PDCD1LG2",
+    "CIITA",
+    "HLA-DRA",
+    "HLA-DRB1",
+    "HLA-DPB1",
+    "SIGLEC10",
+    "LAIR1",
+    "S100A8",
+    "S100A9",
+    "CTSD"
+  ),
+  monocyte_senescence         = c(
+    "CDKN2A",
+    "CDKN1A",
+    "TP53",
+    "RB1",
+    "IL1B",
+    "IL6",
+    "TNF",
+    "CXCL8",
+    "CCL2",
+    "CCL3",
+    "MMP9",
+    "TGFB1",
+    "SERPINE1"
+  ),
+  t_cell_senescence = c(
+    "CDKN2A",
+    "CDKN1A",
+    "TP53",
+    "RB1",
+    "KLRG1",
+    "B3GAT1",
+    "GZMB",
+    "IFNG",
+    "TNF"
+  ),
+  monocyte_activation = c(
+  # Immediate early / inflammatory
+  "IL1B",
+  "TNF",
+  "IL6",
+  "NFKBIA",
+  "JUN",
+  "FOS",
+
+  # Antigen presentation / costimulation
+  "CD74",
+  "HLA-DRA",
+  "HLA-DRB1",
+  "HLA-DPB1",
+  "CIITA",
+
+  # Pattern recognition / activation state
+  "TLR2",
+  "TLR4",
+  "FCGR1A",   # CD64
+  "FCGR3A",   # CD16
+  "LYZ"
+),
+  tcell_activation = c(
+  # Immediate activation
+  "IL2",
+  "IL2RA",    # CD25
+  "CD69",
+  "TNFRSF9",  # 4-1BB
+  "TNFRSF4",  # OX40
+
+  # TCR signaling / transcriptional response
+  "ZAP70",
+  "LCK",
+  "ICOS",
+  "BATF",
+  "IRF4",
+
+  # Effector skew (non-exhaustion)
+  "IFNG",
+  "GZMB"
+)
+)
+
+```
+
+
+###  Summary Df
+
+```{r}
+expected_dir <- c(
+  CIITA      = -1,
+  `HLA-DRA`  = -1,
+  `HLA-DRB1` = -1,
+  `HLA-DPB1` = -1
+)
+
+exp_omics_sens_res_df <- exp_omics_sens_res_df |>
+  mutate(
+    expected_dir = coalesce(expected_dir[feature_map], 1),
+    signed_logFC = logFC * expected_dir
+  )
+
+summary_df <- bind_rows(
+  summarise_set(
+    exp_omics_sens_res_df,
+    gene_sets$tcell_exhaustion,
+    "CD4",
+    "T cell Exhaustion"
+  ),
+  
+  summarise_set(
+    exp_omics_sens_res_df,
+    gene_sets$endotoxin_tolerance,
+    "CD16",
+    "Monocyte Tolerance"
+  ),
+  
+  summarise_set(
+    exp_omics_sens_res_df |>
+      inner_join(
+        senescence_gate(exp_omics_sens_res_df, "CD4"),
+        by = "exposure"
+      ),
+    gene_sets$t_cell_senescence,
+    "CD4",
+    "T cell Senescence"
+  ),
+  
+  summarise_set(
+    exp_omics_sens_res_df |>
+      inner_join(
+        senescence_gate(exp_omics_sens_res_df, "CD16"),
+        by = "exposure"
+      ),
+    gene_sets$monocyte_senescence,
+    "CD16",
+    "Monocyte Senescence"
+  ),
+  summarise_set(
+    exp_omics_sens_res_df,
+    gene_sets$monocyte_activation,
+    "CD16",
+    "Monocyte Activation"
+  ),
+  summarise_set(
+    exp_omics_sens_res_df,
+    gene_sets$tcell_activation,
+    "CD4",
+    "T cell Activation"
+  )
+)
+
+```
+
+###  Grouped
+
+```{r}
+# # Expected direction map, 1 is up and -1 is down
+# 
+# expected_dir <- c(
+#   CIITA     = -1,
+#   `HLA-DRA` = -1,
+#   `HLA-DRB1` = -1,
+#   `HLA-DPB1` = -1
+# )
+# 
+# # Default direction = +1
+# # we are looking for it to go up so we flip the sign
+# # for some genes if down is consistent with the 
+# # phenotype
+# exp_omics_sens_res_df <- exp_omics_sens_res_df |>
+#   mutate(
+#     expected_dir = ifelse(
+#       feature_map %in% names(expected_dir),
+#       expected_dir[feature_map],
+#       1
+#     ),
+#     signed_logFC = logFC * expected_dir
+#   )
+# 
+# # CD4 T-cell exhaustion direction-aware
+# exhaustion_res <- exp_omics_sens_res_df |>
+#   filter(
+#     feature_map %in% gene_sets$tcell_exhaustion,
+#     grepl("CD4", exp_name)
+#   ) |>
+#   group_by(exposure) |>
+#   reframe(
+#     med_signed = median(signed_logFC, 
+#                         na.rm = TRUE),
+#     frac_expected_dir = mean(signed_logFC > 0,
+#                              na.rm = TRUE),
+#     n_genes = n_distinct(feature_map)
+#   ) |>
+#   filter(
+#     n_genes > 1,
+#     frac_expected_dir >= 0.5,
+#     med_signed > 0
+#     
+#   ) |> 
+#   mutate(set="T cell Exhaustion")
+# 
+# 
+# # CD16 monocyte endotoxin tolerance direction-aware
+# tolerance_res <- exp_omics_sens_res_df |>
+#   filter(
+#     feature_map %in% gene_sets$endotoxin_tolerance,
+#     grepl("CD16", exp_name)
+#   ) |>
+#   group_by(exposure) |>
+#   reframe(
+#     med_signed = median(
+#       signed_logFC, na.rm = TRUE),
+#     frac_expected_dir = mean(
+#       signed_logFC > 0, na.rm = TRUE),
+#     n_genes = n_distinct(feature_map)
+#   ) |>
+#   filter(
+#     n_genes > 1,
+#     frac_expected_dir >= 0.5,
+#     med_signed > 0
+#   ) |> 
+#   mutate(set="Monocyte Tolerance")
+# 
+# 
+# # CD4 T-cell senescence gated on cell-cycle arrest
+# tcell_sen_gate <- exp_omics_sens_res_df |>
+#   filter(
+#     feature_map %in% c("CDKN2A", "CDKN1A"),
+#     grepl("CD4", exp_name)
+#   ) |>
+#   group_by(exposure) |>
+#   reframe(
+#     gate_signal = median(logFC, na.rm = TRUE)
+#   ) |>
+#   filter(gate_signal > 0)
+# 
+# tcell_senescence_res <- exp_omics_sens_res_df |>
+#   filter(
+#     feature_map %in% gene_sets$t_cell_senescence,
+#     grepl("CD4", exp_name)
+#   ) |>
+#   inner_join(tcell_sen_gate, by = "exposure") |>
+#   group_by(exposure) |>
+#   reframe(
+#     med_signed = median(
+#       signed_logFC, na.rm = TRUE),
+#     frac_expected_dir = mean(
+#       signed_logFC > 0, na.rm = TRUE),
+#     n_genes = n_distinct(feature_map)
+#   ) |>
+#   filter(
+#     n_genes > 1,
+#     frac_expected_dir >= 0.5,
+#     med_signed > 0
+#   ) |> 
+#   mutate(set="T cell Senescence")
+# 
+# # CD16 monocyte senescence gated on cell-cycle arrest
+# mono_sen_gate <- exp_omics_sens_res_df |>
+#   filter(
+#     feature_map %in% c("CDKN2A", "CDKN1A"),
+#     grepl("CD16", exp_name)
+#   ) |>
+#   group_by(exposure) |>
+#   reframe(
+#     gate_signal = median(logFC, na.rm = TRUE)
+#   ) |>
+#   filter(gate_signal > 0)
+# 
+# mono_senescence_res <- exp_omics_sens_res_df |>
+#   filter(
+#     feature_map %in% gene_sets$monocyte_senescence,
+#     grepl("CD16", exp_name)
+#   ) |>
+#   inner_join(mono_sen_gate, by = "exposure") |>
+#   group_by(exposure) |>
+#   reframe(
+#     med_signed = median(
+#       signed_logFC, na.rm = TRUE),
+#     frac_expected_dir = mean(
+#       signed_logFC > 0, na.rm = TRUE),
+#     n_genes = n_distinct(feature_map)
+#   ) |>
+#   filter(
+#     n_genes > 1,
+#     frac_expected_dir >= 0.5,
+#     med_signed > 0
+#   ) |> 
+#   mutate(set="Monocyte Senescence")
+# 
+# summary_df <- bind_rows(
+#   exhaustion_res,
+#   tolerance_res,
+#   tcell_senescence_res,
+#   mono_senescence_res)
+```
+
+
+
+### Heatmap
+
+```{r}
+summary_df |> 
+    # group_by(exposure) |> 
+    # mutate(n_sets=n_distinct(set)) |> 
+    # ungroup() |> 
+    mutate(
+        set=fct_reorder(set,med_signed),
+        exposure=fct_reorder(exposure,med_signed)
+    ) |> 
+    ggplot(aes(
+        x=set,
+        y=exposure,
+        fill=med_signed
+    ))+
+    geom_tile()+
+    theme_bw()+
+    # scale_fill_gradient(
+    #     low ="#E29587",
+    #     high = "red4"
+    # )+
+  scale_fill_gradientn(
+        colors = c(
+            "#3a1c71",
+            "#d76d77"
+        ),
+        na.value = "grey80")+
+    labs(
+        x="",
+        y="",
+        fill="Median Estimate"
+    )+
+    theme(
+        axis.text.x = element_text(
+            angle = 90,hjust = 1,vjust = 0.3)
+    )
+```
+
+###  Barplot
+
+```{r}
+summary_df |>
+  (\(df) {
+    df |>
+      inner_join(
+        df |> janitor::tabyl(exposure),
+        by = "exposure"
+      )
+  })() |>
+  mutate(
+    exposure_label = if_else(
+      n > 1,
+      paste0(strrep("*", n), " ", exposure),
+      exposure
+    )
+  ) |>
+  group_by(set) |>
+  arrange(med_signed,
+          .by_group = TRUE) |>
+  mutate(
+    exposure_in_set = paste0(
+      exposure_label, "___", set),
+    exposure_in_set = factor(
+      exposure_in_set, levels =
+        unique(exposure_in_set))
+  ) |>
+  ungroup() |>
+  mutate(set=gsub(" Senescence","\nSenescence",set)) |>
+  mutate(set=gsub(" Tolerance","\nTolerance",set)) |>
+  mutate(set=gsub(" Exhaustion","\nExhaustion",set)) |> 
+  ggplot(aes(
+    x = med_signed,
+    y = exposure_in_set,
+    fill = med_signed
+  )) +
+  geom_col(color = "black", 
+           linewidth = 0.005) +
+  facet_grid(~ set, 
+             scales = "free_y", 
+             space = "free_y") +
+  scale_y_discrete(
+    labels = function(x) sub("___.*$", "", x)) +
+  theme_bw() +
+  scale_fill_gradientn(
+    colors = c("#3a1c71", 
+               "#d76d77"),
+    na.value = "grey80"
+  ) +
+  labs(x = "",
+       y = "", 
+       fill = "Median Estimate",
+       caption = "* Appears in more than phenotype.") +
+  theme(
+    strip.text.x = element_text(
+      face = "bold.italic"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    legend.position = "bottom",
+    legend.title.position = "top"
+  )
+```
+###  Heatmap
+
+```{r}
+summary_df |>
+    left_join(
+        summary_df |> janitor::tabyl(exposure),
+        by = "exposure"
+    ) |>
+    mutate(
+        exposure_label = if_else(
+            n > 1,
+            paste0(strrep("*", n), " ", exposure),
+            exposure
+        )
+    ) |>
+    group_by(set) |>
+    arrange(med_signed, .by_group = TRUE) |>
+    mutate(
+        exposure_label = factor(
+            exposure_label,
+            levels = unique(exposure_label)
+        )
+    ) |>
+    ungroup() |> ggplot(
+        aes(
+            x = set,
+            y = exposure_label,
+            fill = med_signed
+        )
+    ) +
+    geom_tile(
+        color = "black",
+        linewidth = 0.2,
+        height = 0.9
+    ) +
+    scale_fill_gradientn(
+        colors = c("#3a1c71", "#d76d77"),
+        na.value = "grey80"
+    ) +
+    labs(
+        x = "",
+        y = "",
+        fill = "Median Estimate",
+        caption = "* Appears in more than one phenotype."
+    ) +
+    theme_bw() +
+    theme(
+        # rotate labels
+        axis.text.x = element_text(
+            angle = 90,
+            vjust = 0.5,
+            hjust = 1
+        ),
+        
+        # remove x-axis formatting
+        axis.title.x = element_blank(),
+        axis.line.x  = element_blank(),
+        
+        axis.text.y = element_text(size = 9),
+        legend.position = "right",
+        legend.title.position = "top"
+    )
+```
+
+## Save Data
+
+```{r}
+saveRDS(th_stability_res,file="../results/lineage/th_stability_res.rds")
+
+saveRDS(th_stability_df,file="../results/lineage/th_stability_df.rds")
+
+saveRDS(path_stability_res,file="../results/lineage/path_stability_res.rds")
+
+saveRDS(path_stability_df,file="../results/lineage/path_stability_df.rds")
+```
+

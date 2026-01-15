@@ -1,0 +1,1404 @@
+---
+title: "Exposome AIRWAYS Analysis"
+subtitle: "Exposure-Omics Association Analysis"
+author: "Jason Laird"
+date: today 
+date-format: short
+engine: knitr
+execute: 
+  warning: false
+  message: false
+  cache: true
+format: 
+  html:
+    code-fold: true
+    theme: 
+      - simplex
+      - custom.scss
+    fontcolor: '#0c051a'
+---
+
+
+## Setup 
+
+### Load Libraries
+
+```{r}
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(janitor)
+library(ggpubr)
+library(ggsci)
+library(tidyexposomics)
+library(MultiAssayExperiment)
+library(furrr)
+library(tidytext)
+
+# Source QC helper functions
+invisible(lapply(
+  list.files(
+    path = "./",
+    pattern = "*.R", full.names = TRUE
+  ),
+  source
+))
+```
+
+### Load Data
+
+```{r}
+# Codebook
+aw_cb <- readRDS("../results/input_data/aw_cb.rds")
+
+# MultiAssayExperiment Object
+fev1_fvc_expom <- readRDS("../results/sens/fev1_fvc_expom.rds")
+
+# Exposure variables
+exp_vars <- readRDS("../results/qc/exp_vars.rds")
+num_exp_vars <- readRDS("../results/qc/num_exp_vars.rds")
+
+# All variables
+vars <- aw_cb$variable |> 
+  (\(chr)chr[chr %in% colnames(colData(fev1_fvc_expom))])()
+
+# Setting colors for exposure categories
+cat_colors <- scales::alpha(get_palette("aaas",13), 0.5) |> 
+  (\(colors){
+    names(colors) <- aw_cb |> 
+      filter(variable %in% exp_vars) |> 
+      pull(category) |> 
+      unique()
+    colors
+  })()
+```
+
+## Differential Abundance - Exposures
+
+```{r}
+# Run differential abundance analysis for all exposures
+plan(multisession)
+
+exp_omics_res <- future_map(
+  exp_vars,
+  ~{
+  message("Working on: ",.x)
+  res <- fev1_fvc_expom |>
+    run_differential_abundance(
+        formula = as.formula(paste0("~ ",.x, " + gli_age + gli_sex + gli_height + fis")),
+        method = "limma_trend",
+        scaling_method = "none",
+        action = "get"
+    ) |> 
+    filter(P.Value<0.05,
+           abs(logFC)>log2(1)) |> 
+    mutate(exposure=.x)
+})
+
+names(exp_omics_res) <- exp_vars
+
+# exp_omics_res_df <- bind_rows(exp_omics_res,.id="exposure") |> 
+#   left_join(aw_cb,
+#             by=c("exposure"="variable"))
+
+exp_omics_res_df <- bind_rows(exp_omics_res) |> 
+  left_join(aw_cb,
+            by=c("exposure"="variable"))
+```
+
+## Sensitivity Analysis
+
+```{r}
+# ran this on the cluster for speed
+# exp_omics_sens_res <- map(
+#   exp_vars,
+#   ~{
+#   message("Working on: ",.x)
+#     fev1_fvc_expom |> 
+#       run_sensitivity_analysis(
+#         base_formula = as.formula(paste0("~ ",.x, " + gli_age + gli_sex + gli_height + fis")),
+#         methods = c("limma_trend"),
+#         scaling_methods = c("none"),
+#         covariates_to_remove = c(
+#             "gli_age",
+#             "gli_sex",
+#             "gli_height",
+#             "fis"
+#         ),
+#         pval_col = "P.Value",
+#         logfc_col = "logFC",
+#         logFC_threshold = log2(1),
+#         pval_threshold = 0.05,
+#         stability_metric = "stability_score",
+#         bootstrap_n = 100,
+#         action = "get"
+#     ) |> 
+#       pluck("feature_stability") |> 
+#       filter(effect_consistency>.7) |> 
+#       mutate(exposure=.x)
+# })
+# 
+# saveRDS(exp_omics_sens_res, file="../results/exposure_omics/exp_omics_sens_res.rds")
+
+  # fev1_fvc_expom |>
+  #   run_differential_abundance(
+  #       formula = as.formula(paste0("~ ",.x, " + gli_age + gli_sex + gli_height + fis")),
+  #       method = "limma_trend",
+  #       scaling_method = "none",
+  #       action = "get"
+  #   ) |> 
+  #   filter(P.Value<0.05,
+  #          abs(logFC)>log2(1)) |> 
+  #   mutate(exposure=.x)
+
+exp_omics_sens_res_df <- exp_omics_sens_res |> 
+  bind_rows() |> 
+  inner_join(exp_omics_res_df,
+             by=c("feature"="feature",
+                  "exp_name"="exp_name",
+                  "exposure"="exposure"))
+
+```
+
+
+### Overlap
+
+```{r}
+asthma_exp_comparison <- c(
+  exp_omics_res,
+  list("FEV1/FVC"=fev1_fvc_expom@metadata |> 
+         pluck("differential_analysis",
+               "differential_abundance") |>
+         filter(P.Value<0.05,abs(logFC)>log2(1)) )
+) |> 
+  map(~{
+    .x |> 
+      mutate(combo=paste(exp_name,feature_map,sep = " ")) |> 
+      pull(combo) |> 
+      unique()
+  }) |> 
+  get_pairwise_overlaps()
+
+asthma_exp_comparison |> 
+    filter(target=="FEV1/FVC") |> 
+    tidygraph::as_tbl_graph() |> 
+    ggraph::ggraph(
+        layout = "linear",
+        circular = TRUE
+    ) +
+    ggraph::geom_edge_arc(aes(
+        color = jaccard,
+        width = log10(num_shared+1)
+    )) +
+    ggraph::geom_node_point(shape = 21,
+                            size = 4,
+                            alpha = 0.8
+    ) +
+    ggraph::geom_node_text(
+        aes(
+            label = name,
+            x = 1.1 * x,
+            y = 1.1 * y,
+            angle = ggraph::node_angle(x, y)
+        ),
+        hjust = "outward",
+        fontface = "bold.italic",
+        check_overlap = TRUE
+    ) +
+    ggraph::theme_graph() +
+  ggraph::scale_edge_color_gradient2(
+        high = "#5f2c82",
+        mid = "white",
+        low = "#49a09d",
+        midpoint = 0.1,
+        guide = ggraph::guide_edge_colorbar()
+    ) +
+    # ggraph::scale_edge_color_gradient2(
+    #     high = "#0f0c29",
+    #     mid = "white",
+    #     low = "#43C6AC",
+    #     midpoint = 0.1,
+    #     guide = ggraph::guide_edge_colorbar()
+    # ) +
+    ggplot2::coord_fixed(xlim = c(-2, 2), ylim = c(-2, 2)) +
+    ggplot2::guides(edge_width = "none") +
+    ggplot2::labs(
+        edge_color = "Jaccard Coef."
+    )
+```
+
+### Lollipop Plot
+
+```{r}
+jc_asthma <- asthma_exp_comparison |> 
+    filter(target=="FEV1/FVC") |> 
+  left_join(aw_cb,
+            by=c("source"="variable")) |> 
+    # Order categories by median effect size
+    mutate(
+        category = forcats::fct_reorder(
+            category, jaccard, .fun = median, .desc = TRUE),
+        
+        # Order terms by estimate (within categories)
+        exposure = forcats::fct_reorder(source, jaccard)
+    ) 
+
+median_df <- jc_asthma |> 
+  group_by(category) |> 
+  summarize(median_jaccard = median(jaccard, na.rm = TRUE), .groups = "drop")
+
+jc_asthma <- jc_asthma |> 
+  left_join(median_df, by = "category")
+
+jc_asthma |> 
+    ggplot(aes(x = jaccard, 
+               y = exposure,
+               fill = jaccard)) +
+    
+    # Add lollipop stems
+    geom_segment(aes(x = 0, xend = jaccard, y = exposure, yend = exposure),
+                 color = "grey70", size = 0.6) +
+    
+    # Lollipop heads
+    geom_point(shape = 21, size = 2.5, stroke = 0.8) +
+    
+    # Facet by category with colored strips
+    ggh4x::facet_grid2(category ~ ., 
+                       scales = "free",
+                       space = "free", 
+                       strip = ggh4x::strip_themed(
+                           background_y = ggh4x::elem_list_rect(
+                               fill = cat_colors[levels(jc_asthma$category)]))) +
+    
+    # Color gradients for fill and stroke
+    scale_fill_gradient2(
+        low = "#c94b4b",
+        mid = "grey85",
+        high = "#4b134f",
+        midpoint = .1
+    ) +
+    
+    # Reference line at 0
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    
+    # Labels and theme
+    labs(
+        title = NULL,
+        x = "Jaccard Coef.",
+        y = "",
+        fill = "Jaccard Coef."
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+        panel.grid.minor = element_blank(),
+        strip.text.y = element_text(angle = 0, face = "bold.italic")
+    )
+```
+### Overlap within Groups
+
+```{r}
+jc_cat <- asthma_exp_comparison |> 
+    filter(!target=="FEV1/FVC") |> 
+    left_join(aw_cb |> 
+                  dplyr::select(variable,
+                                source_category=category),
+              by=c("source"="variable")) |> 
+    left_join(aw_cb |> 
+                  dplyr::select(variable,
+                                target_category=category),
+              by=c("target"="variable")) |> 
+    filter(source_category==target_category) 
+
+# jc_cat |> 
+#     ggplot(aes(
+#         x = jaccard,
+#         y = fct_reorder(source_category,jaccard),
+#         fill = source_category,
+#         color = source_category
+#     )) +
+#     geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+#     #geom_jitter(height = 0.15, alpha = 0.2) +
+#     scale_fill_manual(values=cat_colors)+
+#     scale_color_manual(values=cat_colors)+
+#     theme_bw()+xlim(c(0,.5))+
+#     theme(legend.position = "none",axis.title.x = element_text(size = 10))+
+#     labs(
+#         y = NULL,
+#         fill = "",
+#         color= "",
+#         x = "Jaccard Coef."
+#     )
+
+jc_cat |> 
+  group_by(source_category) |> 
+  reframe(med=median(jaccard)) |> 
+  ggplot(aes(
+    x = med,
+    y = fct_reorder(source_category,med),
+    fill = source_category,
+    color = source_category
+  )) +
+  geom_col(color="black",linewidth = 0.005)+
+  theme_classic()+
+  scale_fill_manual(values=cat_colors)+
+  scale_color_manual(values=cat_colors)+
+  scale_x_continuous(breaks = c(0,0.1,0.2))+
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 10))+
+  labs(
+    y = NULL,
+    fill = "",
+    color= "",
+    x = "Median Jaccard Coef."
+  )
+```
+### Overlap with FEV1/FVC
+
+```{r}
+jc_cat_fvc <- asthma_exp_comparison |> 
+    filter(target=="FEV1/FVC") |> 
+    left_join(aw_cb |> 
+                  dplyr::select(variable,
+                                source_category=category),
+              by=c("source"="variable")) |> 
+    left_join(aw_cb |> 
+                  dplyr::select(variable,
+                                target_category=category),
+              by=c("target"="variable")) 
+
+# jc_cat_fvc |> 
+#     ggplot(aes(
+#         x = jaccard,
+#         y = fct_reorder(source_category,jaccard),
+#         fill = source_category,
+#         color = source_category
+#     )) +
+#     geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+#     #geom_jitter(height = 0.15, alpha = 0.2) +
+#     scale_fill_manual(values=cat_colors)+
+#     scale_color_manual(values=cat_colors)+
+#     theme_bw()+xlim(c(0,.3))+
+#     theme(legend.position = "none",axis.title.x = element_text(size = 10))+
+#     labs(
+#         y = NULL,
+#         fill = "",
+#         color= "",
+#         title="Overlap with FEV1/FVC Features",
+#         x = "Jaccard Coef."
+#     )
+
+jc_cat_fvc |> 
+  group_by(source_category) |> 
+  reframe(med=median(jaccard)) |> 
+  ggplot(aes(
+    x = med,
+    y = fct_reorder(source_category,med),
+    fill = source_category,
+    color = source_category
+  )) +
+  geom_col(color="black",linewidth = 0.005)+
+  theme_classic()+
+  scale_fill_manual(values=cat_colors)+
+  scale_color_manual(values=cat_colors)+
+  scale_x_continuous(breaks = c(0,0.1,0.2))+
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(size = 10))+
+  labs(
+    y = NULL,
+    fill = "",
+    color= "",
+    x = "Median Jaccard Coef."
+  )
+```
+
+### Exposure Omics Impact
+
+```{r}
+exp_omics_sens_res_df |> 
+    group_by(category, exp_name, exposure) |> 
+    summarise(n_degs = n(), 
+              .groups = "drop") |> 
+    group_by(category, exp_name) |> 
+    summarise(median_degs = median(n_degs),
+              .groups = "drop") |>
+    mutate(
+        category = fct_reorder(category, median_degs, .fun = sum)
+    ) |>
+    ggplot(aes(x = category, y = median_degs, fill = exp_name)) +
+    geom_col(alpha=.8,color="black",linewidth = 0.005) +
+    coord_flip() +
+    scale_fill_manual(values=c('#3e2b6f',
+                               "#bdb3d4"	,
+                               '#f27070'	,
+                               "#f1a04b"	,
+                               #"#ffd966",
+                               "#1f0322",
+                               "#8a1c48"	,
+                               "#d96241"	,
+                               "#f1cbcc"	,
+                               "#99bbaa")) +
+    labs(x = "", 
+         y = paste("Median No. of ","Differential Features",sep="\n"),
+         fill = "",
+         title = "") +
+    theme_classic()+
+  theme(legend.position = "bottom")
+```
+
+## Enrichment Analysis
+
+### Set Genesets
+
+```{r}
+enr_sets <- exp_omics_sens_res_df |> 
+  mutate(direction = ifelse(
+    logFC > 0, "Upregulated", "Downregulated"),
+    combo=paste(exposure,exp_name,direction,sep=";")) |> 
+  (\(df)split(df,df$combo))() |> 
+  map(~{
+    .x |> 
+      pull(feature_map) |> 
+      unique()
+  }) |> 
+  (\(lst) lst[lengths(lst)>20])()
+
+rna_features <- pivot_feature(fev1_fvc_expom) |>
+  filter(.exp_name =="CD4 T cell RNA") |>
+  pull(feature_map)
+
+isoform_features <-  pivot_feature(fev1_fvc_expom) |>
+  filter(.exp_name =="CD4 T cell Isoforms") |>
+  pull(feature_map)
+
+proteomics_features <- pivot_feature(fev1_fvc_expom) |>
+  filter(.exp_name =="Proteomics") |>
+  pull(feature_map)
+```
+
+
+### Enrichment
+
+```{r}
+plan(multisession)
+
+exp_enr_res_rna <- future_map(
+  enr_sets |> 
+    (\(lst)lst[grepl("RNA",names(lst))])(),
+  ~{
+    options(GO_ANNOTATION_URL = "http://current.geneontology.org/annotations/goa_human.gaf.gz")
+    
+    run_fenr(
+      selected_genes = .x,
+      universe_genes = rna_features,
+      db = "GO",
+      species = "goa_human",
+      feature_col = "gene_symbol"
+    )
+  },
+  .progress = TRUE
+) |> 
+  bind_rows(.id = "group")
+
+
+exp_enr_res_iso <- future_map(
+  enr_sets |> 
+    (\(lst)lst[grepl("Isoform",names(lst))])(),
+  ~{
+    options(GO_ANNOTATION_URL = "http://current.geneontology.org/annotations/goa_human.gaf.gz")
+    
+    run_fenr(
+      selected_genes = .x,
+      universe_genes = isoform_features,
+      db = "GO",
+      species = "goa_human",
+      feature_col = "gene_symbol"
+    )
+  },
+  .progress = TRUE
+) |> 
+  bind_rows(.id = "group")
+
+exp_enr_res_prot <- future_map(
+  enr_sets |> 
+    (\(lst)lst[grepl("Proteomics",names(lst))])(),
+  ~{
+    options(GO_ANNOTATION_URL = "http://current.geneontology.org/annotations/goa_human.gaf.gz")
+    
+    run_fenr(
+      selected_genes = .x,
+      universe_genes = isoform_features,
+      db = "GO",
+      species = "goa_human",
+      feature_col = "gene_symbol"
+    )
+  },
+  .progress = TRUE
+) |> 
+  bind_rows(.id = "group")
+
+exp_enr_res_sig <- exp_enr_res_rna |> 
+  bind_rows(exp_enr_res_iso) |> 
+  bind_rows(exp_enr_res_prot) |> 
+  filter(p_adjust<.1,
+         n_with_sel>5,
+         N_with< 1000)
+
+parent_terms <- find_parent_terms(exp_enr_res_sig)
+
+exp_enr_res_sig <- exp_enr_res_sig |> 
+  left_join(parent_terms |> 
+              dplyr::select(term,parentTerm),
+            by=c("term_name"="term"))
+```
+### Shared Terms
+
+```{r}
+exp_enr_res_sig <- exp_enr_res_sig |> 
+  separate(col = "group",
+           into = c("exposure","exp_name","direction"),
+           sep=";",
+           remove = F) |> 
+  mutate(cell=case_when(
+    grepl("CD4",group) ~ "CD4",
+    grepl("CD16",group) ~ "CD16",
+    .default = "Other"
+  )) |> 
+  left_join(aw_cb |> 
+              dplyr::select(variable,category),
+            by=c("exposure"="variable"))
+  # separate_rows(ids,sep = ", ") |> 
+  # (\(df) split(df,df$exposure))() |> 
+```
+
+### No. of DEGs by Exposure
+
+```{r}
+exp_omics_sens_res_df |>
+    group_by(exp_name,exposure) |>
+    reframe(n=n()) |>
+    mutate(log_n=log2(n)) |> 
+    ggplot(aes(
+        y=fct_reorder(exposure,log_n),
+        x=fct_reorder(exp_name,-log_n),
+        fill=log_n))+
+    geom_tile()+
+    scale_fill_gradientn(
+        colors = c(
+            "#3a1c71",
+            "#d76d77",
+            "#ffaf7b"
+        ),
+        na.value = "grey80")+
+  theme_classic()+
+  rotate_x_text(angle=45)+
+  labs(
+    x="",
+    y="",
+    fill=expression("Log"[2]*" No. of DEGs")
+  )
+```
+
+### * Barplot No. of DEGs by Exposure
+
+```{r}
+exp_omics_sens_res_df |>
+    group_by(exposure) |>
+    reframe(n=n()) |>
+    ggplot(aes(
+        y=fct_reorder(exposure,n),
+        x=n,
+        fill= n))+
+    geom_col(
+      color="black",linewidth = 0.005
+    )+
+    scale_fill_gradientn(
+        colors = c(
+            "#3a1c71",
+            "#d76d77",
+            "#ffaf7b"
+        ),
+        na.value = "grey80")+
+  theme_classic()+
+  rotate_x_text(angle=45)+
+  labs(
+    x="",
+    y="",
+    fill=expression("No. of Differential Features")
+  )
+```
+
+
+### Common Pathways
+
+```{r}
+common_pathways_vec <-
+  exp_enr_res_sig |>
+  filter(grepl("RNA",exp_name)) |> 
+  filter(p_adjust < 0.05) |>
+  group_by(parentTerm,cell) |>
+  reframe(
+    n_exposures  = n_distinct(exposure),
+    n_cells      = n_distinct(exp_name),
+    median_logp  = median(-log10(p_adjust+1e-12)),
+    median_count = median(n_with_sel),
+    enrichment_score = median_logp * median_count
+  ) |>
+  distinct() |> 
+  filter(n_exposures>=3) |>  
+  # group_by(cell) |>
+  # arrange(desc(n_exposures), desc(enrichment_score)) |> 
+  # slice_head(n=20) |> 
+  pull(parentTerm) |> 
+  unique()
+
+common_pathways <-
+  exp_enr_res_sig |>
+  #filter(grepl("RNA",exp_name)) |> 
+  filter(p_adjust < 0.05) |>
+  group_by(parentTerm,exp_name,direction) |>
+  reframe(
+    n_exposures  = n_distinct(exposure),
+    n_cells      = n_distinct(exp_name),
+    median_logp  = median(-log10(p_adjust+1e-12)),
+    median_count = median(n_with_sel),
+    enrichment_score = median_logp * median_count,
+    enrichment_score = ifelse(
+      direction == "Upregulated",
+      enrichment_score,
+      -enrichment_score
+      )
+  ) |>
+  distinct() |> 
+  arrange(desc(n_exposures), desc(enrichment_score)) |> 
+  filter(parentTerm %in% common_pathways_vec) |> 
+  mutate(
+    cell=case_when(
+      grepl("CD16",exp_name) ~ "CD16+ Monocyte",
+      grepl("CD4",exp_name) ~ "CD4+ T cell",
+      grepl("Proteomics",exp_name) ~ "Proteomics"
+    ),
+    mode=case_when(
+      grepl("RNA",exp_name) ~ "RNA",
+      grepl("Isoform",exp_name) ~ "Isoform",
+      .default = "Protein-Level"
+    )
+  )
+
+common_pathways |>
+  arrange(enrichment_score) |> 
+  mutate(
+    parentTerm=fct_reorder(parentTerm,enrichment_score),
+    combo=paste(cell,mode),
+    #parentTerm=reorder_within(parentTerm,enrichment_score,combo)
+    ) |> 
+  group_by(parentTerm,cell,mode) |> 
+  mutate(cons=ifelse(length(unique(direction))>1,"not","is")  ) |> 
+  ungroup() |> 
+  filter(cons=="is") |> 
+    ggplot(aes(x=direction,
+               y=parentTerm,
+               fill=enrichment_score))+
+    geom_tile()+
+    scale_fill_gradient2(
+        low ="blue4",
+        mid="white",
+        high = "red4",
+        midpoint = 0,
+        limits=c(-100,100),
+        oob=scales::squish
+    )+
+    ggh4x::facet_nested(. ~ cell+mode)+
+    theme_bw()+
+  #scale_y_reordered()+
+    theme(strip.text.x = element_text(face="bold.italic"),
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank())+
+    labs(
+        x="",
+        y="",
+        fill ="Enrichment Score"
+    )
+```
+
+
+### * RNA Common Pathways
+
+```{r}
+common_pathways |>
+  arrange(enrichment_score) |> 
+  mutate(
+    parentTerm=fct_reorder(parentTerm,enrichment_score),
+    combo=paste(cell,mode),
+    #parentTerm=reorder_within(parentTerm,enrichment_score,combo)
+    ) |> 
+  group_by(parentTerm,cell,mode) |> 
+  mutate(cons=ifelse(length(unique(direction))>1,"not","is")  ) |> 
+  ungroup() |> 
+  filter(cons=="is",
+         mode=="RNA") |> 
+    ggplot(aes(x=direction,
+               y=parentTerm,
+               fill=enrichment_score))+
+    geom_tile()+
+    scale_fill_gradient2(
+        low ="blue4",
+        mid="white",
+        high = "red4",
+        midpoint = 0,
+        limits=c(-100,100),
+        oob=scales::squish
+    )+
+    ggh4x::facet_nested(. ~ cell+mode)+
+    theme_bw()+
+  #scale_y_reordered()+
+    theme(strip.text.x = element_text(face="bold.italic"),
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank())+
+    labs(
+        x="",
+        y="",
+        fill ="Enrichment Score"
+    )
+
+```
+
+### * Barplot
+
+```{r}
+common_pathways |>
+  mutate(parentTerm=str_wrap(parentTerm,width=50)) |> 
+    group_by(exp_name) |>
+    slice_max(
+        order_by = n_exposures,
+        n = 10,
+        with_ties = FALSE
+    ) |>
+    ungroup() |>
+    mutate(
+        parentTerm = reorder_within(
+            parentTerm,
+            enrichment_score,
+            exp_name
+        )
+    ) |>
+    ggplot(aes(
+        x = enrichment_score,
+        y = parentTerm,
+        fill = direction
+    )) +
+    geom_col() +
+    scale_y_reordered() +
+    scale_fill_manual(values = c("blue4", "red4")) +
+    facet_grid(
+        exp_name ~ .,
+        scales = "free_y",
+        space = "free"
+    ) +
+    theme_bw()+
+    theme(strip.text.y = element_text(angle = 0,
+                                      face = "bold.italic"))+
+    labs(
+        x="Enrichment Score",
+        y="",
+        fill=""
+    )
+```
+### * Tileplot
+
+```{r}
+common_pathways |>
+  mutate(parentTerm=str_wrap(parentTerm,width=50),
+         exp_name=case_when(
+           exp_name == "CD16 Monocyte Isoforms" ~ "CD16+ Monocyte\nIsoforms",
+           exp_name == "CD4 T cell Isoforms" ~ "CD4+ T cell\nIsoforms",
+           exp_name == "CD4 T cell RNA" ~ "CD4+ T cell\nRNA",
+           exp_name == "CD16 Monocyte RNA" ~ "CD16+ Monocyte\nRNA",
+           exp_name == "Proteomics" ~ "Proteomics",
+         )) |> 
+    group_by(exp_name) |>
+    slice_max(
+        order_by = n_exposures,
+        n = 10,
+        with_ties = FALSE
+    ) |>
+    ungroup() |>
+    mutate(
+        parentTerm = reorder_within(
+            parentTerm,
+            enrichment_score,
+            exp_name
+        )
+    ) |>
+    ggplot(aes(
+        x = 1,
+        y = parentTerm,
+        fill = enrichment_score
+    )) +
+    geom_tile() +
+    scale_y_reordered() +
+    scale_fill_gradient2(
+        low ="blue4",
+        mid="white",
+        high = "red4",
+        limits=c(-100,100),
+        oob=scales::squish,
+        midpoint = 0
+    ) +
+    facet_grid(
+        exp_name ~ .,
+        scales = "free_y",
+        space = "free"
+    ) +
+    theme_bw()+
+    theme(strip.text.y = element_text(angle = 0,
+                                      face = "bold.italic"),
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          legend.position = "bottom",
+          legend.title.position = "top")+
+    labs(
+        x="",
+        y="",
+        fill="Enrichment Score"
+    )
+```
+
+
+## Exposures Driving Terms
+
+```{r}
+exp_gene_long <-
+  exp_enr_res_sig |>
+  mutate(
+    gene = str_split(
+      ids,
+      pattern = "\\s*[;,/|]\\s*|\\s+"
+    )
+  ) |>
+  unnest(gene) |>
+  mutate(gene = str_trim(gene)) |>
+  filter(!is.na(gene), gene != "")
+
+pathway_hits <-
+  exp_gene_long |>
+  filter(
+    #parentTerm == "antigen binding",
+    #parentTerm == "positive regulation of neutrophil chemotaxis",
+    #parentTerm == "PML body",
+    #parentTerm == "cytokine receptor activity",
+    #parentTerm == "immunoglobulin complex",
+    #parentTerm == "immunological synapse",
+    #parentTerm == "T cell differentiation in thymus",
+    #parentTerm == "toll-like receptor 4 signaling pathway",
+    #parentTerm == "damaged DNA binding",
+    p_adjust < 0.05
+  ) |>
+  distinct(
+    parentTerm,
+    gene,
+    exposure,
+    category,
+    direction,
+    cell,
+    exp_name
+  )
+
+gene_summary <-
+  pathway_hits |>
+  group_by(gene) |>
+  summarise(
+    n_exposures  = n_distinct(exposure),
+    n_categories = n_distinct(category),
+    n_cells      = n_distinct(cell),
+    directions   = paste(sort(unique(direction)), collapse = ", "),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_exposures), desc(n_categories), desc(n_cells))
+
+category_summary <-
+  pathway_hits |>
+  group_by(category) |>
+  summarise(
+    n_genes     = n_distinct(gene),
+    n_exposures = n_distinct(exposure),
+    n_hits      = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_genes), desc(n_exposures))
+
+```
+
+
+### * CD4 Heatmap
+
+```{r}
+
+gene_term_counts <-
+  exp_enr_res_sig |>
+  filter(grepl("CD4",group)) |> 
+  filter(p_adjust < 0.05) |>
+  mutate(
+    gene = str_split(
+      ids,
+      pattern = "\\s*[;,/|]\\s*|\\s+"
+    )
+  ) |>
+  unnest(gene) |>
+  mutate(gene = str_trim(gene)) |>
+  filter(!is.na(gene), gene != "") |>
+  filter(
+    parentTerm == "antigen binding" |
+    parentTerm == "positive regulation of neutrophil chemotaxis" |
+    parentTerm == "PML body" |
+    parentTerm == "cytokine receptor activity" |
+    parentTerm == "immunoglobulin complex" |
+    parentTerm == "immunological synapse" |
+    parentTerm == "T cell differentiation in thymus" |
+    parentTerm == "toll-like receptor 4 signaling pathway" |
+    parentTerm == "damaged DNA binding"
+  ) |>
+  distinct(parentTerm, gene, exposure) |>
+  group_by(parentTerm, gene) |>
+  summarise(
+    n_exposures = n_distinct(exposure),
+    .groups = "drop"
+  )
+
+top_genes_per_term <-
+  gene_term_counts |>
+  group_by(parentTerm) |>
+  slice_max(
+    order_by = n_exposures,
+    n = 5,
+    with_ties = FALSE
+  ) |>
+  mutate(
+    gene = fct_reorder(gene, n_exposures)
+  ) |>
+  ungroup()
+
+ggplot(
+    top_genes_per_term,
+    aes(
+        y = parentTerm,
+        x = gene,
+        fill = n_exposures
+    )
+) +
+    geom_tile() +
+    scale_fill_gradientn(
+        colors = c(
+            "#3a1c71",
+            "#d76d77",
+            "#ffaf7b"
+        ),
+        na.value = "grey80")+
+    theme_minimal(base_size = 12) +
+    theme(
+        axis.text.x = element_text(face="italic",
+                                   angle = 45,
+                                   hjust = 1,
+                                   vjust = 1),
+        panel.grid = element_blank(),
+        
+    ) +
+    labs(
+        x = "",
+        y = "",
+        title = expression("CD4"^"+"*" T cell"),
+        fill = "No. of Exposures"
+    )
+```
+
+
+### * CD16 Heatmap
+
+```{r}
+
+gene_term_counts <-
+    exp_enr_res_sig |>
+    filter(grepl("CD16",group)) |> 
+    filter(p_adjust < 0.05) |>
+    mutate(
+        gene = str_split(
+            ids,
+            pattern = "\\s*[;,/|]\\s*|\\s+"
+        )
+    ) |>
+    unnest(gene) |>
+    mutate(gene = str_trim(gene)) |>
+    filter(!is.na(gene), gene != "") |>
+    filter(
+        parentTerm == "antigen binding" |
+            parentTerm == "positive regulation of neutrophil chemotaxis" |
+            parentTerm == "PML body" |
+            parentTerm == "cytokine receptor activity" |
+            parentTerm == "immunoglobulin complex" |
+            parentTerm == "immunological synapse" |
+            parentTerm == "T cell differentiation in thymus" |
+            parentTerm == "toll-like receptor 4 signaling pathway" |
+            parentTerm == "damaged DNA binding"
+    ) |>
+    distinct(parentTerm, gene, exposure) |>
+    group_by(parentTerm, gene) |>
+    summarise(
+        n_exposures = n_distinct(exposure),
+        .groups = "drop"
+    )
+
+top_genes_per_term <-
+    gene_term_counts |>
+    group_by(parentTerm) |>
+    slice_max(
+        order_by = n_exposures,
+        n = 5,
+        with_ties = FALSE
+    ) |>
+    mutate(
+        gene = fct_reorder(gene, n_exposures)
+    ) |>
+    ungroup()
+
+ggplot(
+    top_genes_per_term,
+    aes(
+        y = parentTerm,
+        x = gene,
+        fill = n_exposures
+    )
+) +
+    geom_tile() +
+    scale_fill_gradientn(
+        colors = c(
+            "#3a1c71",
+            "#d76d77",
+            "#ffaf7b"
+        ),
+        na.value = "grey80")+
+    theme_minimal(base_size = 12) +
+    theme(
+        axis.text.x = element_text(face="italic",
+                                   angle = 45,
+                                   hjust = 1,
+                                   vjust = 1),
+        panel.grid = element_blank(),
+        
+    ) +
+    labs(
+        x = "",
+        y = "",
+        title = expression("CD16"^"+"*" Monocyte"),
+        fill = "No. of Exposures"
+    )
+```
+
+### * Combined
+
+```{r}
+gene_term_counts <-
+  exp_enr_res_sig |>
+  filter(
+    grepl("CD4|CD16", group),
+    p_adjust < 0.05
+  ) |>
+  mutate(
+    cell_type = case_when(
+      grepl("CD4", group)  ~ "CD4+ T cell",
+      grepl("CD16", group) ~ "CD16+ Monocyte"
+    ),
+    gene = str_split(
+      ids,
+      pattern = "\\s*[;,/|]\\s*|\\s+"
+    )
+  ) |>
+  unnest(gene) |>
+  mutate(gene = str_trim(gene)) |>
+  filter(!is.na(gene), gene != "") |>
+  filter(
+    parentTerm == "antigen binding" |
+      parentTerm == "positive regulation of neutrophil chemotaxis" |
+      parentTerm == "PML body" |
+      parentTerm == "cytokine receptor activity" |
+      parentTerm == "immunoglobulin complex" |
+      parentTerm == "defense response to virus" |
+      parentTerm == "immunological synapse" |
+      parentTerm == "cell-cell contact zone" |
+      parentTerm == "T cell differentiation in thymus" |
+      parentTerm == "toll-like receptor 4 signaling pathway" |
+      parentTerm == "damaged DNA binding"
+  ) |>
+  distinct(cell_type, parentTerm, gene, exposure) |>
+  group_by(cell_type, parentTerm, gene) |>
+  summarise(
+    n_exposures = n_distinct(exposure),
+    .groups = "drop"
+  )
+
+top_genes_per_term <-
+  gene_term_counts |>
+  group_by(cell_type, parentTerm) |>
+  slice_max(
+    order_by = n_exposures,
+    n = 5,
+    with_ties = FALSE
+  ) |>
+  mutate(
+    gene = fct_reorder(gene, n_exposures)
+  ) |>
+  ungroup()
+
+ggplot(
+  top_genes_per_term,
+  aes(
+    x = gene,
+    y = parentTerm,
+    fill = n_exposures
+  )
+) +
+  geom_tile() +
+  scale_fill_gradientn(
+    colors = c(
+      "#3a1c71",
+      "#d76d77",
+      "#ffaf7b"
+    ),
+    na.value = "grey80"
+  ) +
+  facet_wrap(~ cell_type, ncol = 1, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(
+      face = "italic",
+      angle = 45,
+      hjust = 1,
+      vjust = 1
+    ),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold")
+  ) +
+  labs(
+    x = "",
+    y = "",
+    title = "Top 5 genes per pathway by number of exposures",
+    fill = "No. of Exposures"
+  )
+
+
+```
+
+## * Top Genes
+
+```{r}
+top_exp_genes <- exp_omics_sens_res_df |>
+  mutate(feature_map=case_when(
+    exp_name == "Adduct Burden" ~ feature_id,
+    .default = feature_map
+  )) |> 
+  filter(!grepl("^ENSG|Y_RNA|Metazoa|-AS1$|-AS2$",feature_map)) |> 
+  dplyr::select(feature_map,exposure,exp_name) |>
+  distinct() |>  
+  group_by(feature_map,exp_name) |>
+  reframe(n_exposures=n_distinct(exposure)) |>
+  group_by(feature_map,exp_name) |>
+  mutate(total=sum(n_exposures)) |>
+  ungroup() |> 
+  group_by(exp_name) |> 
+  arrange(desc(n_exposures)) |> 
+  slice_head(n=5)
+
+top_exp_genes |> 
+  mutate(exp_name=fct_reorder(exp_name,n_exposures),
+         feature_map=fct_reorder(feature_map,n_exposures)) |> 
+  ggplot(
+  aes(
+    x = exp_name,
+    y = feature_map,
+    fill = n_exposures
+  )
+) +
+  geom_tile(color="black",linewidth = 0.005) +
+  scale_fill_gradientn(
+    colors = c(
+      "#3a1c71",
+      "#d76d77",
+      "#ffaf7b"
+    ),
+    na.value = "grey80"
+  ) +
+  #facet_wrap(~ cell_type, ncol = 1, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(
+      face = "italic"
+    ),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom",
+    legend.title.position = "top"
+  ) +
+  rotate_x_text(angle = 45)+
+  labs(
+    x = "",
+    y = "",
+    title = "",
+    fill = "No. of Exposures"
+  )
+```
+
+
+
+
+### hot mess
+
+```{r}
+exp_process_summary <-
+  exp_enr_res_sig |>
+  filter(p_adjust < 0.05) |>
+  group_by(exposure, term_id, term_name) |>
+  summarise(
+    n_cell_contexts = n_distinct(exp_name),
+    n_directions    = n_distinct(direction),
+    mean_enrichment = mean(enrichment),
+    max_odds_ratio  = max(odds_ratio),
+    min_p           = min(p_adjust),
+    median_p        = median(p_adjust),
+    median_count    = median(n_with_sel),
+    .groups = "drop"
+  ) |>
+  arrange(exposure, min_p)
+
+exp_term_matrix <-
+  exp_enr_res_sig |>
+  filter(p_adjust < 0.05) |>
+  distinct(exposure, parentTerm) |>
+  mutate(present = 1) |>
+  pivot_wider(
+    names_from = exposure,
+    values_from = present,
+    values_fill = 0
+  ) |> 
+  filter(!is.na(parentTerm)) |> 
+  column_to_rownames("parentTerm")
+
+exp_pathway_mat <-
+  exp_enr_res_sig |>
+  filter(p_adjust < 0.05) |>
+  group_by(exposure, parentTerm) |>
+  summarise(
+    median_logp  = median(-log10(p_adjust+1e-12)),
+    median_count = median(n_with_sel),
+    enrichment_score = median_logp * median_count,
+    .groups = "drop"
+  ) |>
+  dplyr::select(-c(median_logp,median_count)) |> 
+  pivot_wider(
+    names_from  = exposure,
+    values_from = enrichment_score,
+    values_fill = 0
+  ) |> 
+  filter(!is.na(parentTerm)) |> 
+  column_to_rownames("parentTerm")
+
+exp_pathway_mat_scaled <- t(scale(t(exp_pathway_mat)))
+mat_scaled[is.na(mat_scaled)] <- 0
+
+exp_pathway_dist_exp <- dist(t(exp_pathway_mat_scaled), method = "euclidean")
+
+exp_pathway_dist_hc_exp   <- hclust(exp_pathway_dist_exp, method = "ward.D2")
+
+factoextra::fviz_nbclust(
+    exp_pathway_mat_scaled,
+    FUNcluster = factoextra::hcut,
+    method = "gap",
+    hc_method = "ward.D2",
+    nboot = 100
+)
+
+clusters <- data.frame(
+  exposure=names(cutree(exp_pathway_dist_hc_exp, k = 9)),
+  cluster=cutree(exp_pathway_dist_hc_exp, k = 9))
+  
+exp_enr_clustered <-
+  exp_enr_res_sig |>
+  inner_join(clusters, by = "exposure") |>
+  filter(p_adjust < 0.05)
+
+
+top_terms_per_cluster <-
+  exp_enr_clustered |>
+  group_by(cluster, cell,parentTerm) |>
+  summarise(
+    n_exposures = n_distinct(exposure),
+    median_logp  = median(-log10(p_adjust+1e-12)),
+    median_count = median(n_with_sel),
+    enrichment_score = median_logp * median_count,
+    .groups = "drop"
+  ) |>
+  group_by(cluster) |>
+  slice_max(enrichment_score, n = 10) |>
+  ungroup()
+
+
+```
+
+
+### Shared terms among exposures
+
+```{r}
+exp_enr_g <- exp_enr_res_sig |> 
+  (\(df)split(df,df$exposure))() |> 
+  map(~{
+    .x |> 
+      pull(parentTerm) |> 
+      unique()
+  }) |> 
+  get_pairwise_overlaps() |> 
+  dplyr::select(source,target,jaccard) |> 
+  tidygraph::as_tbl_graph() |> 
+  mutate(degree=tidygraph::centrality_degree()) |> 
+  left_join(aw_cb |> 
+              dplyr::select(variable,category),
+            by=c("name"="variable")) |> 
+  mutate(lab=ifelse(degree>60,name,NA))
+
+exp_enr_g |> 
+    ggraph(layout="fr") +
+    geom_edge_link(aes(
+      edge_width = jaccard),
+      alpha = 0.7,
+      color = "grey80") +
+    geom_node_point(aes(
+      size = degree,
+      color = category),
+      alpha = 0.9) +
+  geom_node_point(aes(
+      size = degree,
+      color = category),
+                  color = "black",
+                  stroke = 0.005,
+                  shape = 21,
+                  fill = NA) +
+    geom_node_label(
+      aes(label = lab),
+      size = 3,
+      repel = TRUE) +
+  scale_color_manual(values=cat_colors)+
+    scale_size_continuous(range = c(2, 10)) +
+    theme_void()
+```
+
+
+## Save Data
+
+```{r}
+saveRDS(exp_omics_res,file="../results/exposure_omics/exp_omics_res.rds")
+
+saveRDS(exp_omics_sens_res_df,file="../results/exposure_omics/exp_omics_sens_res_df.rds")
+
+saveRDS(exp_enr_res_sig,file="../results/exposure_omics/exp_enr_res_sig.rds")
+
+```
+
