@@ -645,6 +645,7 @@ enr_res_sig |>
     )+
     theme(strip.text = element_text(face="bold.italic"))
 ```
+
 #### Broad GO Modules
 
 ```{r}
@@ -728,6 +729,7 @@ mod_df |>
         fill=expression(-Log[10]*"P*Count")
     )
 ```
+
 #### * Parent Term Heatmap
 
 ```{r}

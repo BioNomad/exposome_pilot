@@ -1,0 +1,2789 @@
+## Old Isoform Switching ----------------------
+cd4_se <- tidyexposomics:::.update_assay_colData(fev1_fvc_expom,"CD4 T cell Isoforms")
+
+cd16_se <- tidyexposomics:::.update_assay_colData(fev1_fvc_expom,"CD16 Monocyte Isoforms")
+
+cd4_iso_res <- run_isoform_switching_satuRn(
+  se = cd4_se,
+  counts_assay = "counts",
+  tx2gene_df = rowData(cd4_se) |> 
+    as.data.frame() |> 
+    dplyr::select(isoform_id=transcript_id,
+                  gene_id=gene_id),
+  formula = ~ pftfev1fvc_actual + gli_age + gli_sex + fis,
+  contrast_var = "pftfev1fvc_actual",
+  verbose = TRUE
+)
+
+cd16_iso_res <- run_isoform_switching_satuRn(
+  se = cd16_se,
+  counts_assay = "counts",
+  tx2gene_df = rowData(cd16_se) |>
+    as.data.frame() |> 
+    dplyr::select(isoform_id=transcript_id,
+                  gene_id=gene_id),
+  formula = ~ pftfev1fvc_actual + gli_age + gli_sex + fis,
+  contrast_var = "pftfev1fvc_actual",
+  verbose = TRUE
+)
+
+
+## Old Go Enrichment  --------------
+# Get GO Data
+go_term_data <- {
+  options(GO_ANNOTATION_URL = "https://ftp.ebi.ac.uk/pub/databases/GO/goa/HUMAN")
+  
+  go_mapping <- fenr:::fetch_go_genes_go(
+    species   = "goa_human",
+    use_cache = TRUE,
+    on_error  = "stop"
+  )
+  
+  go_terms <- fenr:::fetch_go_terms(
+    use_cache = TRUE,
+    on_error  = "stop"
+  )
+  
+  list(terms = go_terms, mapping = go_mapping)
+}
+
+
+## Old GO Enrichment 2 -----------
+# deg_df <- extract_results(fev1_fvc_expom,
+#                           result = "differential_analysis") |> 
+#   pluck("differential_abundance") |> 
+#   # temp fix for adduct burden data
+#   mutate(feature_map=case_when(
+#     exp_name == "Adduct Burden" ~ feature_name,
+#     .default = feature_map
+#   )) |> 
+#   filter(P.Value < 0.05)
+
+robust_deg_df <- fev1_fvc_expom@metadata |> 
+  pluck("differential_analysis",
+        "sensitivity_analysis",
+        "feature_stability") |> 
+  filter(effect_consistency>.7) |> 
+  inner_join(
+    fev1_fvc_expom@metadata |> 
+      pluck("differential_analysis",
+            "differential_abundance"),
+    by=c("exp_name"="exp_name",
+         "feature"="feature")) |>
+  filter(P.Value<0.05)
+
+robust_deg_lst <- robust_deg_df |> 
+  mutate(direction = ifelse(logFC > 0, "Upregulated", "Downregulated")) |> 
+  group_by(exp_name, direction) |> 
+  group_split(.keep = TRUE) |> 
+  set_names(
+    robust_deg_df |> 
+      mutate(direction = ifelse(logFC > 0, "Upregulated", "Downregulated")) |> 
+      group_by(exp_name, direction) |> 
+      group_keys() |> 
+      transmute(name = paste(exp_name, direction, sep = "_")) |> 
+      pull(name)
+  ) |> 
+  map(
+    ~.x$feature_map
+  ) 
+
+# Ensure there are enough for enrichment
+robust_deg_lst <- robust_deg_lst[lengths(robust_deg_lst)>20]
+
+# # DTU results
+# dtu_lst <- cd4_iso_res$results |> 
+#   mutate(exp_name="CD4 T cell Isoforms DTU") |> 
+#   bind_rows(cd16_iso_res$results |> 
+#               mutate(exp_name="CD16 Monocyte Isoforms DTU") ) |> 
+#   mutate(direction = ifelse(estimates > 0, "Upregulated", "Downregulated")) |> 
+#   filter(pval<0.05) |> 
+#   group_by(exp_name, direction) |> 
+#   group_split(.keep = TRUE) |> 
+#   set_names(
+#     cd4_iso_res$results |> 
+#       mutate(exp_name="CD4 T cell Isoforms DTU") |> 
+#       bind_rows(cd16_iso_res$results |> 
+#                   mutate(exp_name="CD16 Monocyte Isoforms DTU") ) |> 
+#       mutate(direction = ifelse(estimates > 0, "Upregulated", "Downregulated")) |> 
+#       filter(pval<0.05) |> 
+#       group_by(exp_name, direction) |> 
+#       mutate(direction = ifelse(estimates > 0, "Upregulated", "Downregulated")) |> 
+#       group_by(exp_name, direction) |> 
+#       group_keys() |> 
+#       transmute(name = paste(exp_name, direction, sep = "_")) |> 
+#       pull(name)
+#   ) |> 
+#   map(
+#     ~.x$gene_name
+#   ) 
+
+rna_features <- pivot_feature(fev1_fvc_expom) |>
+  filter(.exp_name =="CD4 T cell RNA") |>
+  pull(feature_map)
+
+isoform_features <- pivot_feature(fev1_fvc_expom) |>
+  filter(.exp_name =="CD4 T cell Isoforms") |>
+  pull(feature_map)
+
+library(furrr)
+
+plan(multisession)
+
+enr_res_rna <- future_map(
+  robust_deg_lst |> 
+    (\(lst)lst[grepl("RNA",names(lst))])(),
+  ~{
+    options(GO_ANNOTATION_URL = "http://current.geneontology.org/annotations/goa_human.gaf.gz")
+    
+    run_fenr(
+      selected_genes = .x,
+      universe_genes = rna_features,
+      db = "GO",
+      species = "goa_human",
+      feature_col = "gene_symbol"
+    )
+  },
+  .progress = TRUE
+) |> 
+  bind_rows(.id = "group")
+
+
+enr_res_iso <- future_map(
+  robust_deg_lst |> 
+    (\(lst)lst[grepl("Isoform",names(lst))])(),
+  ~{
+    options(GO_ANNOTATION_URL = "http://current.geneontology.org/annotations/goa_human.gaf.gz")
+    
+    run_fenr(
+      selected_genes = .x,
+      universe_genes = isoform_features,
+      db = "GO",
+      species = "goa_human",
+      feature_col = "gene_symbol"
+    )
+  },
+  .progress = TRUE
+) |> 
+  bind_rows(.id = "group")
+
+enr_res_sig <- enr_res_rna |> 
+  bind_rows(enr_res_iso) |> 
+  filter(p_adjust<.1,
+         n_with_sel>5,
+         N_with< 1000)
+
+parent_terms <- find_parent_terms(enr_res_sig)
+
+enr_res_sig <- enr_res_sig |> 
+  left_join(parent_terms |> 
+              dplyr::select(term,parentTerm),
+            by=c("term_name"="term"))
+
+enr_res_sig |> 
+  tabyl(group) |> 
+  view()
+
+
+## -----------------------
+cd4_terms <- enr_res_sig |> 
+  mutate(cell=case_when(
+    grepl("CD16",group) ~ "CD16+ Monocyte",
+    grepl("CD4",group) ~ "CD4+ T cell"
+  )) |>
+  filter(cell=="CD4+ T cell") |> 
+  group_by(term_name) |> 
+  reframe(n=length(unique(group)),
+          median_p=median(p_adjust),
+          median_count=median(n_with_sel))
+
+cd16_terms <- enr_res_sig |> 
+  mutate(cell=case_when(
+    grepl("CD16",group) ~ "CD16+ Monocyte",
+    grepl("CD4",group) ~ "CD4+ T cell"
+  )) |>
+  filter(cell=="CD16+ Monocyte") |> 
+  group_by(term_name) |> 
+  reframe(n=length(unique(group)),
+          median_p=median(p_adjust),
+          median_count=median(n_with_sel))
+
+cd4_unique_terms <- cd4_terms |> 
+  filter(term_name %in% 
+           setdiff(cd4_terms$term_name,cd16_terms$term_name))
+
+cd16_unique_terms <- cd16_terms |> 
+  filter(term_name %in% 
+           setdiff(cd16_terms$term_name,cd4_terms$term_name))
+
+shared_terms <- enr_res_sig |> 
+  mutate(cell=case_when(
+    grepl("CD16",group) ~ "CD16+ Monocyte",
+    grepl("CD4",group) ~ "CD4+ T cell"
+  )) |>
+  group_by(term_name) |> 
+  reframe(n=length(unique(group)),
+          median_p=median(p_adjust),
+          median_count=median(n_with_sel)) |> 
+  filter(term_name %in%  
+           Reduce(
+             intersect,
+             list(cd4_terms$term_name,cd16_terms$term_name))
+  )
+
+
+
+## ----------------------------------------------------------------------------------------------------
+enr_res_sig |> 
+  filter(term_name %in% (
+    shared_terms |> 
+      arrange(desc(n)) |> 
+      slice_head(n=50) |> 
+      pull(term_name)
+  )) |> 
+  mutate(
+    cell=case_when(
+      grepl("CD16",group) ~ "CD16+ Monocyte",
+      grepl("CD4",group) ~ "CD4+ T cell"
+    ),
+    direction=case_when(
+      grepl("Down",group) ~ "Downregulated",
+      grepl("Up",group) ~ "Upregulated"
+    )) |> 
+  mutate(group=gsub("_.*","",group)) |> 
+  ggplot(aes(
+    x=group,
+    y=fct_reorder2(term_name,paste(group,direction),direction),
+    size=n_with_sel,
+    color=-log10(p_adjust+1e-300)
+  ))+
+  geom_point()+
+  scale_color_gradient(
+    low = "#43C6AC",
+    high = "#191654"
+  )+
+  theme_bw()+
+  facet_grid(. ~ cell+direction,space = "free",scales="free")+
+  rotate_x_text(angle=45)+
+  scale_x_discrete(labels=c(
+    "CD4 T cell RNA"             = expression(CD4^"+" ~ "T cell RNA"),
+    "CD4 T cell Isoforms"        = expression(CD4^"+" ~ "T cell Isoforms"),
+    "CD4 T cell Isoforms DTU"    = expression(CD4^"+" ~ "T cell Isoforms DTU"),
+    
+    "CD16 Monocyte RNA"          = expression(CD16^"+" ~ "Monocyte RNA"),
+    "CD16 Monocyte Isoforms"     = expression(CD16^"+" ~ "Monocyte Isoforms"),
+    "CD16 Monocyte Isoforms DTU" = expression(CD16^"+" ~ "Monocyte Isoforms DTU")
+  ))+
+  labs(
+    x="",
+    y="",
+    color=expression("-Log"[10]*"P"),
+    size="Count"
+  )+
+  theme(strip.text = element_text(face="bold.italic"))
+
+
+## ----------------------------------------------------------------------------------------------------
+enr_res_sig |> 
+  filter(term_name %in% (
+    cd4_unique_terms |> 
+      arrange(desc(n)) |> 
+      slice_head(n=40) |> 
+      pull(term_name)
+  )) |> 
+  mutate(
+    cell=case_when(
+      grepl("CD16",group) ~ "CD16+ Monocyte",
+      grepl("CD4",group) ~ "CD4+ T cell"
+    ),
+    direction=case_when(
+      grepl("Down",group) ~ "Downregulated",
+      grepl("Up",group) ~ "Upregulated"
+    )) |> 
+  mutate(group=gsub("_.*","",group)) |> 
+  ggplot(aes(
+    x=group,
+    y=fct_reorder2(term_name,paste(group,direction),direction),
+    size=n_with_sel,
+    color=-log10(p_adjust+1e-300)
+  ))+
+  geom_point()+
+  scale_color_gradient(
+    low = "#43C6AC",
+    high = "#191654"
+  )+
+  theme_bw()+
+  facet_grid(cell ~ direction,space = "free",scales="free")+
+  rotate_x_text(angle=45)+
+  scale_x_discrete(labels=c(
+    "CD4 T cell RNA"             = expression(CD4^"+" ~ "T cell RNA"),
+    "CD4 T cell Isoforms"        = expression(CD4^"+" ~ "T cell Isoforms"),
+    "CD4 T cell Isoforms DTU"    = expression(CD4^"+" ~ "T cell Isoforms DTU"),
+    
+    "CD16 Monocyte RNA"          = expression(CD16^"+" ~ "Monocyte RNA"),
+    "CD16 Monocyte Isoforms"     = expression(CD16^"+" ~ "Monocyte Isoforms"),
+    "CD16 Monocyte Isoforms DTU" = expression(CD16^"+" ~ "Monocyte Isoforms DTU")
+  ))+
+  labs(
+    x="",
+    y="",
+    color=expression("-Log"[10]*"P"),
+    size="Count"
+  )+
+  theme(strip.text = element_text(face="bold.italic"))
+
+
+## ----------------------------------------------------------------------------------------------------
+enr_res_sig |> 
+  filter(term_name %in% (
+    cd16_unique_terms |> 
+      arrange(desc(n)) |> 
+      slice_head(n=40) |> 
+      pull(term_name)
+  )) |> 
+  mutate(
+    cell=case_when(
+      grepl("CD16",group) ~ "CD16+ Monocyte",
+      grepl("CD4",group) ~ "CD4+ T cell"
+    ),
+    direction=case_when(
+      grepl("Down",group) ~ "Downregulated",
+      grepl("Up",group) ~ "Upregulated"
+    )) |> 
+  mutate(group=gsub("_.*","",group)) |> 
+  ggplot(aes(
+    x=group,
+    y=fct_reorder2(term_name,paste(group,direction),direction),
+    size=n_with_sel,
+    color=-log10(p_adjust+1e-300)
+  ))+
+  geom_point()+
+  scale_color_gradient(
+    low = "#43C6AC",
+    high = "#191654"
+  )+
+  theme_bw()+
+  facet_grid(cell ~ direction,space = "free",scales="free")+
+  rotate_x_text(angle=45)+
+  scale_x_discrete(labels=c(
+    "CD4 T cell RNA"             = expression(CD4^"+" ~ "T cell RNA"),
+    "CD4 T cell Isoforms"        = expression(CD4^"+" ~ "T cell Isoforms"),
+    "CD4 T cell Isoforms DTU"    = expression(CD4^"+" ~ "T cell Isoforms DTU"),
+    
+    "CD16 Monocyte RNA"          = expression(CD16^"+" ~ "Monocyte RNA"),
+    "CD16 Monocyte Isoforms"     = expression(CD16^"+" ~ "Monocyte Isoforms"),
+    "CD16 Monocyte Isoforms DTU" = expression(CD16^"+" ~ "Monocyte Isoforms DTU")
+  ))+
+  labs(
+    x="",
+    y="",
+    color=expression("-Log"[10]*"P"),
+    size="Count"
+  )+
+  theme(strip.text = element_text(face="bold.italic"))
+
+
+## ----------------------------------------------------------------------------------------------------
+mod_df <- enr_res_sig |> 
+  filter(!grepl("DTU",group)) |> 
+  mutate(
+    cell=case_when(
+      grepl("CD16",group) ~ "CD16+ Monocyte",
+      grepl("CD4",group) ~ "CD4+ T cell"
+    ),
+    direction=case_when(
+      grepl("Down",group) ~ "Downregulated",
+      grepl("Up",group) ~ "Upregulated"
+    ),
+    mode=case_when(
+      grepl("RNA",group) ~ "RNA",
+      grepl("Isoform",group) ~ "Isoform"
+    )) |> group_by(parentTerm,mode,cell,direction) |>
+  reframe(n=n(),
+          median_p=median(p_adjust+
+                            min(enr_res_sig$p_adjust[enr_res_sig$p_adjust!=0])),
+          median_count=median(n_with_sel),
+          score=-log10(median_p)*median_count) |> 
+  mutate(
+    dir_sign = ifelse(direction == "Upregulated", 1, -1),
+    signed_score = score * dir_sign
+  )
+
+mod_df |> 
+  group_by(parentTerm, cell, direction,mode) %>%
+  summarise(total = sum(n)) %>%
+  mutate(direction = ifelse(direction=="Upregulated", "Up", "Down")) |> 
+  # filter(parentTerm %in% c(mod_df |> 
+  #                            group_by(parentTerm) |>
+  #                            mutate(total=sum(n)) |>
+  #                            ungroup() |> 
+  #                            dplyr::select(parentTerm,total) |>
+  #                            distinct() |> 
+  #                            arrange(desc(total)) |> 
+  #                            slice_head(n=50) |>
+  #                            pull(parentTerm))) |> 
+  filter(parentTerm %in% c(mod_df |>
+                             group_by(parentTerm) |>
+                             mutate(total=sum(n)) |>
+                             ungroup() |>
+                             group_by(cell) |> 
+                             arrange(desc(n)) |>
+                             slice_head(n=10) |>
+                             pull(parentTerm))) |>
+  ggplot( aes(x = cell,
+              y = fct_reorder(parentTerm,total), 
+              fill = total)) +
+  geom_tile(alpha=.9) +
+  facet_grid(mode ~ direction) +
+  scale_fill_gradientn(
+    colors = c(
+      #"#03001e",
+      #"#7303c0",
+      #"#ec38bc",
+      #"#fdeff9",
+      "#3a1c71",
+      "#d76d77",
+      "#ffaf7b"
+    ),
+    na.value = "grey80")+
+  # scale_fill_gradient(
+  #   low="#0f0c29",
+  #   #mid = ,
+  #   high="#F0C27B"
+  # )+
+  # scale_fill_viridis_c(option = "B") +
+  theme_bw()+
+  rotate_x_text(angle=90)+
+  scale_x_discrete(labels=c(
+    "CD4+ T cell"       = expression(CD4^"+" ~ "T cell"),
+    "CD16+ Monocyte"       = expression(CD16^"+" ~ "Monocyte")))+
+  theme(strip.text = element_text(face="bold.italic"))+
+  labs(
+    x="",
+    y="",
+    fill=expression(-Log[10]*"P*Count")
+  )
+
+
+## ----------------------------------------------------------------------------------------------------
+mod_df |>
+  group_by(parentTerm, direction) |>
+  mutate(parent_dir_score = sum(abs(signed_score))) |>
+  ungroup() |>
+  group_by(parentTerm) |>
+  mutate(parent_n = sum(n),has_rna="RNA" %in% mode) |>
+  ungroup() |>
+  filter(parent_n > 30,has_rna==T) |>
+  mutate(
+    parentTerm = fct_reorder(parentTerm, parent_dir_score)
+  ) |> 
+  ggplot( aes(x = direction,
+              y = parentTerm, 
+              fill = signed_score)) +
+  geom_tile(alpha=.9) +
+  ggh4x::facet_nested(. ~ cell+mode)+
+  scale_fill_gradient2(
+    low ="#5399b0",
+    mid="white",
+    high = "#9B6981FF",
+    midpoint = 0,
+    limits=c(-100,100),
+    oob=scales::squish
+  )+
+  theme_bw()+
+  rotate_x_text(angle=90)+
+  scale_x_discrete(labels=c(
+    "CD4+ T cell"       = expression(CD4^"+" ~ "T cell"),
+    "CD16+ Monocyte"       = expression(CD16^"+" ~ "Monocyte")))+
+  theme(strip.text = element_text(face="bold.italic"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())+
+  labs(
+    x="",
+    y="",
+    fill="Enrichment Score"
+  )
+
+
+## ----------------------------------------------------------------------------------------------------
+top_enr_terms <- enr_res_sig |> group_by(group) |> dplyr::count(parentTerm) |> ungroup() |> group_by(group) |> arrange(desc(n)) |> slice_head(n=5) |> pull(parentTerm) |> unique()
+
+gene_tbl <- map(
+  crossing(a=unique(enr_res_sig$group),
+           b=top_enr_terms) |>
+    mutate(combo=paste(a,b,sep=":")) |>
+    pull(combo),
+  ~ {
+    grp=.x |> strsplit(":") |> (\(chr)chr[[1]][1])()
+    
+    pt=.x |> strsplit(":") |> (\(chr)chr[[1]][2])()
+    
+    enr_res_sig |>
+      filter(group==grp,
+             parentTerm==pt) |> 
+      separate_rows(sep=", ",ids) |> 
+      tabyl(ids) |> 
+      mutate(group=grp,
+             parentTerm=pt)
+  } ) |> 
+  bind_rows() |> 
+  group_by(group,parentTerm) |> 
+  arrange(desc(n)) |> 
+  slice_head(n=5) |> 
+  mutate(
+    cell=case_when(
+      grepl("CD16",group) ~ "CD16+ Monocyte",
+      grepl("CD4",group) ~ "CD4+ T cell"
+    ),
+    direction=case_when(
+      grepl("Down",group) ~ "Downregulated",
+      grepl("Up",group) ~ "Upregulated"
+    ),
+    mode=case_when(
+      grepl("RNA",group) ~ "RNA",
+      grepl("Isoform",group) ~ "Isoform"
+    ),
+    exp_name = gsub("_.*","",group),
+    feature=ids) |> 
+  left_join(robust_deg_df |> 
+              mutate(direction=case_when(
+                logFC<0 ~ "Downregulated",
+                logFC>0 ~ "Upregulated"
+              )),
+            by=c("feature"="feature_map",
+                 "exp_name"="exp_name",
+                 "direction"="direction"))
+
+
+
+## ----------------------------------------------------------------------------------------------------
+top_enr_terms <- enr_res_sig |> group_by(group) |> dplyr::count(parentTerm) |> ungroup() |> group_by(group) |> arrange(desc(n)) |> slice_head(n=5) |> pull(parentTerm) |> unique()
+
+gene_tbl <- enr_res_sig |>
+  filter(parentTerm %in% top_enr_terms) |>
+  separate_rows(ids, sep = ", ") |>
+  dplyr::count(group, parentTerm, ids, name = "n") |>
+  group_by(group, parentTerm) |>
+  slice_max(n, n = 3, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(
+    cell = case_when(
+      grepl("CD16", group) ~ "CD16+ Monocyte",
+      grepl("CD4",  group) ~ "CD4+ T cell"
+    ),
+    direction = case_when(
+      grepl("Down", group) ~ "Downregulated",
+      grepl("Up",   group) ~ "Upregulated"
+    ),
+    mode = case_when(
+      grepl("RNA",     group) ~ "RNA",
+      grepl("Isoform", group) ~ "Isoform"
+    ),
+    exp_name = gsub("_.*", "", group),
+    feature  = ids
+  ) |>
+  filter(mode == "RNA") |> 
+  left_join(
+    robust_deg_df |>
+      mutate(
+        direction = case_when(
+          logFC < 0 ~ "Downregulated",
+          logFC > 0 ~ "Upregulated"
+        )
+      ),
+    by = c(
+      "feature"   = "feature_map",
+      "exp_name"  = "exp_name",
+      "direction" = "direction"
+    )
+  )
+
+gene_tbl |> 
+  filter(mode=="RNA") |> 
+  mutate(
+    parentTerm = fct_reorder2(parentTerm,ids, cell)
+  ) |> 
+  ggplot(aes(
+    y = ids,
+    x = cell,
+    color = logFC,
+    size=-log10(P.Value)
+  )) +
+  geom_point() +
+  facet_grid(parentTerm ~ cell, 
+             scales = "free",
+             space = "free") +
+  scale_color_gradient2(
+    low = "#5399b0",
+    mid = "white",
+    high = "#9B6981FF",
+    midpoint = 0, 
+    limits = c(-10, 10),
+    oob = scales::squish
+  ) +
+  theme_classic()+
+  theme(axis.text.y = element_text(face="italic"),
+        strip.text.y = element_text(angle=0))+
+  rotate_x_text(angle = 45)
+
+
+
+## ----------------------------------------------------------------------------------------------------
+#| fig-width: 12
+#| fig-height: 6
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(tidytext)
+
+top_cd4_enr_terms <- enr_res_sig |> 
+  filter(grepl("CD4",group),
+         grepl("RNA",group)) |> 
+  mutate(strength=-log10(p_adjust)*n_with_sel) |> 
+  group_by(parentTerm) |> 
+  reframe(med_str=median(strength),
+          n=n()) |> 
+  ungroup() |> 
+  filter(n>10) |> 
+  arrange(desc(med_str)) |> 
+  slice_head(n=15) |> 
+  pull(parentTerm) |>
+  unique()
+
+enr_res_sig |>
+  mutate(
+    direction = case_when(
+      grepl("Up",   group) ~ "Upregulated",
+      grepl("Down", group) ~ "Downregulated"
+    ),
+    cell = case_when(
+      grepl("CD4",  group) ~ "CD4+ T cell",
+      grepl("CD16", group) ~ "CD16+ Monocyte"
+    ),
+    mode = case_when(
+      grepl("RNA",     group) ~ "RNA",
+      grepl("Isoform", group) ~ "Isoform"
+    ),
+    strength = -log10(p_adjust + 1e-10)
+  ) |>
+  filter(
+    cell == "CD4+ T cell",
+    mode == "RNA",
+    !is.na(direction),
+    !is.na(cell)
+  ) |>
+  # group_by(cell) |>
+  # arrange(desc(strength)) |>
+  # slice_head(n = 8) |>
+  # ungroup() |>
+  filter(parentTerm %in% top_cd4_enr_terms) |> 
+  group_by(parentTerm,direction) |>
+  reframe(total = median(strength),cell=cell) |>
+  ungroup() |>
+  distinct() |> 
+  mutate(
+    parentTerm = str_wrap(parentTerm, width = 60)
+  ) |>
+  ggplot(aes(
+    x = total,
+    y = reorder_within(parentTerm, total, cell),
+    fill = direction
+  )) +
+  geom_col(alpha = 0.8) +
+  scale_y_reordered() +
+  facet_wrap(~ cell, scales = "free", nrow = 1) +
+  scale_fill_manual(
+    values = c(
+      "Upregulated"   = "#9B6981FF",
+      "Downregulated" = "#5399b0"
+    )
+  ) +
+  geom_vline(
+    xintercept = -log10(0.05 + 1e-10),
+    linetype = "dashed"
+  ) +
+  theme_pubr(legend = "bottom") +
+  labs(
+    x = expression("-Log"[10] * " Adj. P"),
+    y = NULL,
+    fill = ""
+  ) +
+  theme(
+    strip.text = element_text(face = "bold.italic"),
+    axis.text.y = element_text(size = 10)
+  )
+
+
+
+## ----------------------------------------------------------------------------------------------------
+top_cd16_enr_terms <- enr_res_sig |> 
+  filter(grepl("CD16",group)) |> 
+  #group_by(group) |> 
+  dplyr::count(parentTerm) |> 
+  #ungroup() |> 
+  #group_by(group) |> 
+  arrange(desc(n)) |> 
+  slice_head(n=10) |>
+  pull(parentTerm) |>
+  unique()
+
+enr_res_sig |>
+  mutate(
+    direction = case_when(
+      grepl("Up",   group) ~ "Upregulated",
+      grepl("Down", group) ~ "Downregulated"
+    ),
+    cell = case_when(
+      grepl("CD4",  group) ~ "CD4+ T cell",
+      grepl("CD16", group) ~ "CD16+ Monocyte"
+    ),
+    mode = case_when(
+      grepl("RNA",     group) ~ "RNA",
+      grepl("Isoform", group) ~ "Isoform"
+    ),
+    strength = -log10(p_adjust + 1e-10)
+  ) |>
+  filter(
+    cell == "CD16+ Monocyte",
+    !is.na(direction),
+    !is.na(cell)
+  ) |>
+  # group_by(cell) |>
+  # arrange(desc(strength)) |>
+  # slice_head(n = 8) |>
+  # ungroup() |>
+  filter(parentTerm %in% top_cd4_enr_terms) |> 
+  group_by(parentTerm) |>
+  mutate(total = sum(strength)) |>
+  ungroup() |>
+  mutate(
+    parentTerm = str_wrap(parentTerm, width = 60)
+  ) |>
+  ggplot(aes(
+    x = strength,
+    y = reorder_within(parentTerm, total, cell),
+    fill = direction
+  )) +
+  geom_col(alpha = 0.8) +
+  scale_y_reordered() +
+  facet_wrap(~ cell, scales = "free", nrow = 1) +
+  scale_fill_manual(
+    values = c(
+      "Upregulated"   = "#9B6981FF",
+      "Downregulated" = "#5399b0"
+    )
+  ) +
+  geom_vline(
+    xintercept = -log10(0.05 + 1e-10),
+    linetype = "dashed"
+  ) +
+  theme_pubr(legend = "bottom") +
+  labs(
+    x = expression("-Log"[10] * " Adj. P"),
+    y = NULL,
+    fill = ""
+  ) +
+  theme(
+    strip.text = element_text(face = "bold.italic"),
+    axis.text.y = element_text(size = 10)
+  )
+
+
+## ----------------------------------------------------------------------------------------------------
+mod_df |>
+  group_by(parentTerm) |> 
+  mutate(parent_n=sum(n)) |> 
+  ungroup() |> 
+  filter(parent_n>10) |> 
+  ggplot( aes(x = cell,
+              y = fct_reorder(parentTerm,n), 
+              fill = signed_score)) +
+  geom_tile(alpha=.9) +
+  facet_grid(mode ~ direction) +
+  scale_fill_gradient2(
+    low ="#5399b0",
+    mid="white",
+    high = "#9B6981FF",
+    midpoint = 0,
+    limits=c(-200,200),
+    oob=scales::squish
+  )+
+  theme_bw()+
+  rotate_x_text(angle=90)+
+  scale_x_discrete(labels=c(
+    "CD4+ T cell"       = expression(CD4^"+" ~ "T cell"),
+    "CD16+ Monocyte"       = expression(CD16^"+" ~ "Monocyte")))+
+  theme(strip.text = element_text(face="bold.italic"))+
+  labs(
+    x="",
+    y="",
+    fill=expression(-Log[10]*"P*Count")
+  )
+
+
+## ----------------------------------------------------------------------------------------------------
+a <- map(
+  unique(enr_res_sig$group),
+  ~{
+    enr_res_sig |>
+      filter(group==.x) |> 
+      separate_rows(sep=", ",ids) |> 
+      filter(grepl("adhesion",term_name)) |> 
+      pull(ids) |> 
+      unique()
+  } ) |> 
+  set_names(unique(enr_res_sig$group))
+
+gene_tbl <- enr_res_sig |>
+  separate_rows(ids, sep = ", ") |>
+  mutate(
+    direction = case_when(
+      grepl("Upregulated", group) ~ "Up",
+      grepl("Downregulated", group) ~ "Down"
+    ),
+    cell_type = case_when(
+      grepl("CD4", group) ~ "CD4",
+      grepl("CD16", group) ~ "CD16"
+    ),
+    mode = case_when(
+      grepl("Isoforms", group) ~ "Isoform",
+      grepl("RNA", group) ~ "RNA"
+    )
+  )
+
+a <- robust_deg_df |> 
+  mutate(direction=ifelse(logFC>0,"Up","Down")) |> 
+  mutate(
+    cell_type = case_when(
+      grepl("CD4", exp_name) ~ "CD4",
+      grepl("CD16", exp_name) ~ "CD16"
+    ),
+    mode = case_when(
+      grepl("Isoforms", exp_name) ~ "Isoform",
+      grepl("RNA", exp_name) ~ "RNA"
+    )
+  ) |> 
+  group_by(cell_type,mode,feature_map) |> 
+  dplyr::count(direction)
+
+a <- gene_tbl |> 
+  filter(mode=="Isoform") |> 
+  group_by(cell_type,ids) |> 
+  dplyr::count(direction) |> 
+  mutate(consistency=length(unique(direction)))
+
+
+## Deconvolution -------------------------------
+monaco <- read_tsv("./data/rna_immune_cell_monaco.tsv")
+
+monaco_cd4_ref <- monaco |> 
+  filter(`Immune cell` %in% c(
+    "Memory CD4 T-cell TFH",
+    "Memory CD4 T-cell Th1" ,
+    "Memory CD4 T-cell Th1/Th17",
+    "Memory CD4 T-cell Th17",
+    "Memory CD4 T-cell Th2",
+    "naive CD4 T-cell",
+    "T-reg",
+    "Terminal effector memory CD4 T-cell"
+  )) |> 
+  mutate(log=log2(nTPM+1)) |> 
+  dplyr::select(Gene,`Immune cell`,log) |> 
+  pivot_wider(names_from = "Immune cell",
+              values_from = "log") |> 
+  column_to_rownames("Gene")
+
+cd4_cibersort_se <- tidyexposomics:::.update_assay_colData(
+  fev1_fvc_expom,
+  "CD4 T cell RNA") |>
+  tidybulk::deconvolve_cellularity(
+    method="cibersort",
+    reference = monaco_cd4_ref
+  )
+
+# cd4_se <- tidyexposomics:::.update_assay_colData(
+#   fev1_fvc_expom,
+#   "CD4 T cell RNA") |> 
+#   (\(se){
+#     assay(se,"log") <- log2(assay(se,"counts")+1);
+#     se
+#   })() |> 
+#   tidybulk::deconvolve_cellularity(
+#     .abundance = "log",
+#     method="cibersort",
+#     reference = monaco_cd4_ref
+#   )
+
+cd4_llsr_se <- tidyexposomics:::.update_assay_colData(
+  fev1_fvc_expom,
+  "CD4 T cell RNA") |>
+  (\(se){
+    assay(se,"log") <- log2(assay(se,"counts")+1);
+    se
+  })() |>
+  tidybulk::deconvolve_cellularity(
+    .abundance = "log",
+    method="llsr",
+    reference = monaco_cd4_ref
+  )
+
+library(immunedeconv)
+cd4_epic_se <- tidyexposomics:::.update_assay_colData(
+  fev1_fvc_expom,
+  "CD4 T cell RNA") |>
+  (\(se){
+    assay(se,"log") <- log2(assay(se,"counts")+1);
+    se
+  })() |>
+  tidybulk::deconvolve_cellularity(
+    .abundance = "log",
+    method="epic",
+    reference = monaco_cd4_ref
+  )
+
+# How I originally saved the data
+# saveRDS( tidyexposomics:::.update_assay_colData(
+#   fev1_fvc_expom,
+#   "CD4 T cell RNA") |>
+#   (\(se){
+#     assay(se,"log") <- log2(assay(se,"counts")+1);
+#     se
+#   })(),
+#   file="./results/deconvolution/cd4_se.rds")
+# 
+# saveRDS(monaco_cd4_ref,
+#         file="./results/deconvolution/monaco_cd4_ref.rds")
+
+# run on mac bc of error with tidybulk PC handling
+decon <- readRDS("./results/deconvolution/decon.rds")
+
+
+# decon_res <- map(
+#   pivot_sample(decon) |> 
+#     colnames() |> 
+#     (\(chr)chr[grepl("cell|T.reg",chr)])(),
+#   ~ {glm( as.formula(paste0(
+#     "pftfev1fvc_actual ~ ",
+#     .x,
+#     " + gli_age + gli_sex + gli_height + fis")),
+#     data=pivot_sample(decon)) |>
+#       broom::tidy() |>
+#       mutate(cell=.x)}) |>
+#   bind_rows() |>
+#   filter(grepl("cell|T.reg",term)) |> 
+#   mutate(
+#     cell_clean = dplyr::case_when(
+#       term == "Memory.CD4.T.cell.TFH"        ~ "Tfh (memory CD4)",
+#       term == "Memory.CD4.T.cell.Th1"        ~ "Th1 (memory CD4)",
+#       term == "Memory.CD4.T.cell.Th2"        ~ "Th2 (memory CD4)",
+#       term == "Memory.CD4.T.cell.Th17"       ~ "Th17 (memory CD4)",
+#       term == "Memory.CD4.T.cell.Th1.Th17"   ~ "Th1/Th17 (memory CD4)",
+#       term == "Terminal.effector.memory.CD4.T.cell" ~ "Terminal effector memory CD4",
+#       term == "naive.CD4.T.cell"             ~ "Naive CD4",
+#       term == "T.reg"                        ~ "Treg",
+#       TRUE                                   ~ term
+#     )
+#   )
+
+
+## ----------------------------------------------------------------------------------------------------
+library(dplyr)
+library(purrr)
+library(compositions)
+library(broom)
+
+ps <- tidybulk::pivot_sample(decon)
+
+cell_cols <- colnames(ps)[grepl("cell|T.reg", colnames(ps))]
+
+cell_mat <- ps |>
+  dplyr::select(all_of(cell_cols)) |>
+  as.matrix()
+
+# Zero handling (required for CLR)
+cell_mat[cell_mat == 0] <- 1e-6
+
+# CLR transform
+clr_mat <- compositions::clr(cell_mat)
+colnames(clr_mat) <- paste0("clr_", cell_cols)
+
+meta <- ps |>
+  dplyr::select(
+    pftfev1fvc_actual,
+    gli_age,
+    gli_sex,
+    gli_height,
+    fis
+  )
+
+model_df <- bind_cols(meta, as.data.frame(clr_mat))
+
+# Fit one model per CLR component
+decon_res <- map_dfr(
+  colnames(clr_mat),
+  function(clr_col) {
+    lm(
+      as.formula(paste(
+        "pftfev1fvc_actual ~",
+        clr_col,
+        "+ gli_age + gli_sex + gli_height + fis"
+      )),
+      data = model_df
+    ) |>
+      tidy() |>
+      filter(term == clr_col) |>
+      mutate(cell = sub("^clr_", "", clr_col))
+  }
+)
+
+
+decon_res <- decon_res |>
+  mutate(
+    cell_clean = case_when(
+      cell == "Memory.CD4.T.cell.TFH"        ~ "Tfh (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th1"        ~ "Th1 (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th2"        ~ "Th2 (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th17"       ~ "Th17 (memory CD4)",
+      cell == "Memory.CD4.T.cell.Th1.Th17"   ~ "Th1/Th17 (memory CD4)",
+      cell == "Terminal.effector.memory.CD4.T.cell" ~ "Terminal effector memory CD4",
+      cell == "naive.CD4.T.cell"             ~ "Naive CD4",
+      cell == "T.reg"                        ~ "Treg",
+      TRUE                                   ~ cell
+    )
+  )
+
+
+
+## ----------------------------------------------------------------------------------------------------
+decon_res |> 
+  ggplot(aes(
+    x = estimate,
+    y = fct_reorder(cell_clean,estimate),
+    color = estimate,
+    size = -log10(p.value)
+  )) +
+  geom_point(alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  theme(strip.text.y = element_text(angle = 0,
+                                    face="bold.italic"),
+        strip.text.x = element_text(face="bold.italic"),
+        axis.text.y = element_text(face = "italic")) +
+  scale_color_gradient2(
+    low = "#5399b0",
+    mid = "grey85",
+    high = "#9B6981FF",
+    midpoint = 0,
+    # limits=c(-.3,.3),
+    # oob=scales::squish
+  ) +
+  labs(
+    x = "Effect size",
+    y = NULL,
+    color = "Estimate",
+    size = expression("-Log"[10] * "P")
+  )
+
+
+## ----------------------------------------------------------------------------------------------------
+
+decon_res |> 
+  ggplot(aes(x = estimate, 
+             y = fct_reorder(cell_clean,estimate),
+             color = estimate,
+             fill = estimate)) +
+  geom_point(shape = 18, 
+             size = 3, 
+             stroke = 0.8) +
+  geom_errorbarh(aes(xmin = estimate - 1.96 * std.error,
+                     xmax = estimate + 1.96 * std.error),
+                 height = 0.15) +
+  scale_color_gradient2(
+    low="#5399b0",
+    mid="grey85",
+    high="#9B6981FF",
+    midpoint = 0
+  )+
+  scale_fill_gradient2(
+    low="#5399b0",
+    mid="grey85",
+    high="#9B6981FF",
+    midpoint = 0
+  )+
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = NULL,
+    x = paste("Effect size",
+              "(CLR log-ratio, 95% CI)",
+              sep = "\n"),
+    y = "",
+    fill ="Effect size",
+    color ="Effect size"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x = element_text(size=10),
+        strip.text.y = element_text(angle=0,
+                                    face="bold.italic"),
+        axis.text.y = element_text(face = "italic"),
+        legend.position = "none")
+
+
+## ----------------------------------------------------------------------------------------------------
+
+top_cd4_enr_terms <- mod_df |>
+  group_by(parentTerm, direction) |>
+  mutate(parent_dir_score = sum(abs(signed_score))) |>
+  ungroup() |>
+  group_by(parentTerm) |>
+  mutate(parent_n = sum(n),has_rna="RNA" %in% mode) |>
+  ungroup() |>
+  #filter(parent_n > 30,has_rna==T) |>
+  pull(parentTerm) |>
+  unique()
+
+top_cd4_enr_terms <- top_cd4_enr_terms[!is.na(top_cd4_enr_terms)]
+
+cd4_rna_features <- map(
+  top_cd4_enr_terms,
+  ~{
+    enr_res_sig |> 
+      filter(parentTerm %in% .x) |> 
+      separate_rows(sep=", ",ids) |> 
+      pull(ids) |> 
+      unique()}) |> 
+  set_names(top_cd4_enr_terms)
+
+cd4_se <- tidyexposomics:::.update_assay_colData(
+  fev1_fvc_expom,
+  "CD4 T cell RNA") |> 
+  (\(se){
+    assay(se,"log") <- log2(assay(se,"counts")+1);
+    se
+  })()
+
+
+cd4_mat <- cd4_se |>
+  pivot_se() |>
+  dplyr::select(.sample, gene_name, log) |>
+  pivot_wider(
+    names_from  = gene_name,
+    values_from = log,
+    values_fn   = mean
+  ) |>
+  column_to_rownames(".sample") |>
+  as.matrix()
+
+cd4_gsva_par <- gsvaParam(
+  t(cd4_mat),            # matrix: samples x genes
+  cd4_rna_features,         # list of gene sets
+  #method = "ssgsea",   # or "gsva", "zscore", "plage"
+  kcdf = "Gaussian",   # use "Gaussian" for log-transformed RNA-seq data
+  absRanking = TRUE    # use original ssGSEA normalization
+)
+
+cd4_gsva_df <- gsva(cd4_gsva_par) |> 
+  t() |> 
+  as.data.frame() |> 
+  rownames_to_column(".sample") |> 
+  left_join(
+    cd4_se |>
+      tidybulk::pivot_sample(),
+    by = ".sample"
+  ) 
+
+# Assume this gives: .sample, Th1, Th2, Treg, etc.
+th_profiles <- decon |> 
+  tidybulk::pivot_sample() |>
+  dplyr::select(.sample, contains("cell"), contains("T.reg"))
+
+# Join with GSVA scores
+cd4_merged <- cd4_gsva_df |>
+  dplyr::select(names(cd4_rna_features),.sample) |> 
+  inner_join(th_profiles, by = ".sample") |> 
+  inner_join(tidybulk::pivot_sample(cd4_se) |> 
+               dplyr::select(.sample,
+                             gli_age,
+                             gli_sex,
+                             gli_height,
+                             fis),
+             by=".sample")
+
+# Get list of GSVA terms and Th features
+gsva_cols <- cd4_gsva_df |> 
+  dplyr::select(names(cd4_rna_features),.sample) |> 
+  colnames() |> 
+  setdiff(".sample")
+th_cols   <- th_profiles |>
+  colnames() |> 
+  setdiff(".sample")
+
+# Correlation per GSVA x Th combination
+# library(purrr)
+# 
+# gsva_cor_res <- crossing(gsva = gsva_cols, th = th_cols) |>
+#     mutate(
+#         cor = map2_dbl(gsva,
+#                        th, ~ cor(cd4_merged[[.x]],
+#                                  cd4_merged[[.y]],
+#                                  method = "spearman")),
+#         pval = map2_dbl(gsva,
+#                         th, ~ cor.test(cd4_merged[[.x]], 
+#                                        cd4_merged[[.y]],
+#                                        method = "spearman")$p.value)
+#     )
+
+gsva_assoc_res <-
+  expand_grid(
+    gsva = gsva_cols,
+    th   = th_cols
+  ) |>
+  mutate(
+    model = map2(
+      gsva,
+      th,
+      ~ {
+        fml <- as.formula(paste(
+          "`",
+          .x,
+          "`~ `",
+          .y,
+          "`+ gli_age + gli_sex + gli_height + fis"
+          ,sep=""))
+        lm(fml, data = cd4_merged)
+      }
+    )
+  ) |>
+  mutate(
+    tidy = map(model, tidy)
+  ) |>
+  unnest(tidy) |>
+  filter(term == th) |>
+  select(
+    gsva,
+    th,
+    estimate,
+    std.error,
+    statistic,
+    p.value
+  ) |> 
+  mutate(
+    cell_clean = case_when(
+      th == "Memory.CD4.T.cell.TFH"               ~ "Tfh (memory CD4)",
+      th == "Memory.CD4.T.cell.Th1"               ~ "Th1 (memory CD4)",
+      th == "Memory.CD4.T.cell.Th2"               ~ "Th2 (memory CD4)",
+      th == "Memory.CD4.T.cell.Th17"              ~ "Th17 (memory CD4)",
+      th == "Memory.CD4.T.cell.Th1.Th17"          ~ "Th1/Th17 (memory CD4)",
+      th == "Terminal.effector.memory.CD4.T.cell" ~ "Terminal effector memory CD4",
+      th == "naive.CD4.T.cell"                    ~ "Naive CD4",
+      th == "T.reg"                               ~ "Treg",
+      TRUE                                          ~ th
+    )
+  )
+
+
+## ----------------------------------------------------------------------------------------------------
+stability_df <- cd4_merged |>
+  dplyr::select(
+    all_of(gsva_cols),
+    all_of(th_cols),
+    gli_age, gli_sex, gli_height, fis
+  )
+
+# colnames(stability_df) <- gsub("\\ |\\-","_",colnames(stability_df))
+# 
+# gsva_cols <- gsub("\\ |\\-","_",gsva_cols)
+
+gsva_th_stability_res <- future_map(
+  gsva_cols,
+  ~ {
+    run_exwas_sensitivity(
+      df = stability_df,
+      exposures = th_cols,
+      outcome = .x,
+      covariates = c("gli_age", "gli_sex", "gli_height", "fis"),
+      covariates_to_remove = c("gli_age", "gli_sex", "gli_height", "fis"),
+      family = gaussian(),
+      bootstrap_n = 100
+    )$sensitivity_df |>
+      mutate(
+        pathway = .x
+      )
+  },.options = furrr_options(seed = 123)
+) |> 
+  bind_rows()
+
+# gsva_th_stability_res <-
+#   # expand_grid(
+#   #   gsva = gsva_cols,
+#   #   th   = th_cols
+#   # ) 
+#   # examine the significant associations
+# gsva_assoc_res |> 
+#   filter(p.value<0.05) |> 
+#   dplyr::select(gsva,th) |>
+#   mutate(
+#     sens = map2(
+#       gsva,
+#       th,
+#       ~ {
+#         run_exwas_sensitivity(
+#           df = stability_df,
+#           exposures = .y,               # Th score
+#           outcome   = .x,               # GSVA score
+#           covariates = c(
+#             "gli_age", "gli_sex",
+#             "gli_height", "fis"
+#           ),
+#           covariates_to_remove = c(
+#             "gli_age", "gli_sex",
+#             "gli_height", "fis"
+#           ),
+#           family = gaussian(),
+#           bootstrap_n = 100
+#         )$sensitivity_df |>
+#           mutate(
+#             gsva = .x,
+#             th   = .y
+#           )
+#       }
+#     )
+#   ) |>
+#   select(-sens) |>
+#   unnest(sens)
+
+
+gsva_th_stability_df <-
+  gsva_th_stability_res |>
+  dplyr::rename(th=exposure) |> 
+  dplyr::rename(gsva=pathway) |> 
+  mutate(
+    signif = (p_value <= 0.05),
+    sign   = sign(estimate)
+  ) |>
+  group_by(gsva, th) |>
+  summarise(
+    n_tests = n(),
+    n_signif = sum(signif, na.rm = TRUE),
+    prop_signif = n_signif / n_tests,
+    median_effect = median(estimate, na.rm = TRUE),
+    median_p = median(p_value, na.rm = TRUE),
+    sd_effect = sd(estimate, na.rm = TRUE),
+    sign_consistency =
+      ifelse(
+        all(is.na(sign)),
+        NA_real_,
+        abs(sum(sign, na.rm = TRUE)) / n_tests
+      ),
+    stability_score = prop_signif * sign_consistency,
+    .groups = "drop"
+  ) |> 
+  inner_join(gsva_assoc_res,
+             by=c(
+               "th"="th",
+               "gsva"="gsva"
+             ))
+
+
+
+## ----------------------------------------------------------------------------------------------------
+gsva_th_stability_df |>
+  filter(p.value<0.05,
+         sign_consistency>0.7) |>
+  group_by(cell_clean) |> 
+  reframe(med=median(estimate)) |>
+  ggplot(aes(
+    x = med,
+    y = fct_reorder(cell_clean,med),
+    fill = med
+  )) +
+  geom_col(color = "black", 
+           linewidth = 0.005) +
+  theme_bw() +
+  scale_fill_gradient2(
+    low ="#5399b0",
+    mid="white",
+    high = "#9B6981FF",
+    midpoint = 0
+  )+scale_x_continuous(breaks = c(-1,-.5,.1))+
+  labs(x = "",
+       y = "", 
+       fill = "Median Estimate") +
+  theme(
+    strip.text.x = element_text(
+      face = "bold.italic"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    legend.position = "right",
+    legend.title.position = "top"
+  )
+
+
+## ----------------------------------------------------------------------------------------------------
+pmap(
+  expand_grid(
+    consistency = c(0.3, 0.5, 0.7, 0.9),
+    p_cutoff    = c(0.1, 0.05)
+  ),
+  \(consistency,p_cutoff){
+    gsva_th_stability_df |>
+      filter(p.value<p_cutoff,
+             sign_consistency>consistency) |>
+      group_by(cell_clean) |> 
+      reframe(med=median(estimate),
+              n=n(),
+              cell_clean=paste(cell_clean," (",n,")",sep="")) |> 
+      distinct() |> 
+      (\(df){
+        df |> 
+          ggplot(aes(
+            x = med,
+            y = fct_reorder(cell_clean,med),
+            fill = med
+          )) +
+          geom_col(color = "black", 
+                   linewidth = 0.005) +
+          theme_bw() +
+          scale_fill_gradient2(
+            low ="#5399b0",
+            mid="white",
+            high = "#9B6981FF",
+            midpoint = 0
+          )+
+          scale_x_continuous(breaks = c(-1,-.5,.1))+
+          labs(x = "",title="Th-Airway Obstruction",
+               y = "", 
+               caption=paste("P <",p_cutoff, "& Effect Consistency >",consistency*100,"%"),
+               fill = "Median Estimate") +
+          theme(
+            strip.text.x = element_text(
+              face = "bold.italic"),
+            panel.grid.major.x = element_blank(),
+            panel.grid.minor   = element_blank(),
+            legend.position = "right",
+            legend.title.position = "top",
+            plot.title = element_text(
+              size=12
+            )
+          ) })()
+  }) |> 
+  wrap_plots(ncol = 2)
+
+gsva_th_stability_df |>
+  filter(p.value<0.05,
+         sign_consistency>0.9) |>
+  group_by(cell_clean) |> 
+  reframe(med=median(estimate)) |> (\(df){
+    df |> 
+      ggplot(aes(
+        x = med,
+        y = fct_reorder(cell_clean,med),
+        fill = med
+      )) +
+      geom_col(color = "black", 
+               linewidth = 0.005) +
+      theme_bw() +
+      scale_fill_gradient2(
+        low ="#5399b0",
+        mid="white",
+        high = "#9B6981FF",
+        midpoint = 0
+      )+scale_x_continuous(breaks = c(-1,-.5,.1))+
+      labs(x = "",title="Th-Airway Obstruction Pathway", 
+           subtitle = paste("N:", nrow(gsva_th_stability_df |>
+                                         filter(p.value<0.05,
+                                                sign_consistency>0.9))," Exposures"),
+           y = "", caption="P < 0..05 & Effect Consistency > 90%",
+           fill = "Median Estimate") +
+      theme(
+        strip.text.x = element_text(
+          face = "bold.italic"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor   = element_blank(),
+        legend.position = "right",
+        legend.title.position = "top"
+      ) })()
+
+
+
+## ----------------------------------------------------------------------------------------------------
+gsva_cor_res |> 
+  mutate(th=gsub("\\."," ",th)) |> 
+  mutate(combo=paste(th,gsva)) |> 
+  group_by(combo) |> 
+  reframe(med_cor=median(cor),th,gsva) |>
+  distinct() |> 
+  arrange(med_cor) |> 
+  dplyr::select(th,gsva,med_cor) |> 
+  tidygraph::as_tbl_graph() |> 
+  ggraph::ggraph(
+    layout = "linear",
+    circular = TRUE
+  ) +
+  ggraph::geom_edge_arc(aes(
+    color = med_cor,
+    width = abs(med_cor)*10
+  )) +
+  ggraph::geom_node_point(shape = 21,
+                          size = 4,
+                          alpha = 0.8
+  ) +
+  ggraph::geom_node_text(
+    aes(
+      label = stringr::str_wrap(name, width = 15),
+      x = 1.1 * x,
+      y = 1.1 * y,
+      angle = ggraph::node_angle(x, y)
+    ),
+    hjust = "outward",
+    fontface = "bold.italic",
+    lineheight = 0.9,
+    check_overlap = TRUE
+  ) +
+  ggraph::theme_graph() +
+  ggraph::scale_edge_color_gradient2(
+    high = "#C33764",
+    mid = "white",
+    low = "#1D2671",
+    midpoint = 0,
+    guide = ggraph::guide_edge_colorbar()
+  ) +
+  ggplot2::coord_fixed(xlim = c(-2, 2), ylim = c(-2, 2)) +
+  ggplot2::guides(edge_width = "none") +
+  ggplot2::labs(
+    edge_color = "Median Correlation"
+  )+
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal")
+
+
+## ----------------------------------------------------------------------------------------------------
+#| fig-width: 10
+#| fig-height: 10
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+gsva_cor_res |>
+  #filter(pval<0.05) |> 
+  mutate(
+    th = case_when(
+      th == "Memory.CD4.T.cell.TFH"        ~ "Tfh (memory CD4)",
+      th == "Memory.CD4.T.cell.Th1"        ~ "Th1 (memory CD4)",
+      th == "Memory.CD4.T.cell.Th2"        ~ "Th2 (memory CD4)",
+      th == "Memory.CD4.T.cell.Th17"       ~ "Th17 (memory CD4)",
+      th == "Memory.CD4.T.cell.Th1.Th17"   ~ "Th1/Th17 (memory CD4)",
+      th == "Terminal.effector.memory.CD4.T.cell" ~ "Terminal effector memory CD4",
+      th == "naive.CD4.T.cell"             ~ "Naive CD4",
+      th == "T.reg"                        ~ "Treg",
+      TRUE                                   ~ th
+    )
+  ) |> 
+  group_by(th, gsva) |>
+  summarise(
+    med_cor = median(cor, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(th=fct_reorder(th,med_cor),
+         gsva=fct_reorder(gsva,med_cor)) |> 
+  ggplot(aes(
+    x = gsva,
+    y = th,
+    fill = med_cor
+  )) +
+  geom_tile(color = "grey90") +
+  scale_fill_gradient2(
+    low = "#1D2671",
+    mid = "white",
+    high = "#C33764",
+    midpoint = 0
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 65, hjust = 1),
+    axis.text.y = element_text(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    x = "",
+    y = "",
+    fill = "Median Correlation"
+  )
+
+
+
+## ----------------------------------------------------------------------------------------------------
+library(msigdbr)
+focused_set <- list(
+  "Monocyte Chemotaxis"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_MONOCYTE_CHEMOTAXIS",gs_name)) |> 
+    pull(gene_symbol),
+  
+  "T cell Chemotaxis"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_T_CELL_CHEMOTAXIS",gs_name)) |> 
+    pull(gene_symbol),
+  "Cytokine Production"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_CYTOKINE_PRODUCTION",gs_name)) |> 
+    pull(gene_symbol),
+  "Type I Interferon Production"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_TYPE_I_INTERFERON_PRODUCTION",gs_name)) |> 
+    pull(gene_symbol),
+  "Type II Interferon Production" =msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_TYPE_II_INTERFERON_PRODUCTION",gs_name)) |> 
+    pull(gene_symbol),
+  "Response to Type II Interferon"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_RESPONSE_TO_TYPE_II_INTERFERON",gs_name)) |> 
+    pull(gene_symbol),
+  "Response to Type I Interferon"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_RESPONSE_TO_TYPE_I_INTERFERON",gs_name)) |> 
+    pull(gene_symbol),
+  "T-cell-Mediated Cytoxicity"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_T_CELL_MEDIATED_CYTOTOXICITY",gs_name)) |> 
+    pull(gene_symbol),
+  "T-cell Proliferation"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_T_CELL_PROLIFERATION",gs_name)) |> 
+    pull(gene_symbol),
+  "Leukocyte Proliferation"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_LEUKOCYTE_PROLIFERATION",gs_name)) |> 
+    pull(gene_symbol),
+  "Cell-Cell Adhesion"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_CELL_CELL_ADHESION",gs_name)) |> 
+    pull(gene_symbol),
+  "Cell-Endothelial Adhesion"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_LEUKOCYTE_ADHESION_TO_VASCULAR_ENDOTHELIAL_CELL",gs_name)) |> 
+    pull(gene_symbol),
+  "Cell-Cell Adhesion via Integrin"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_CELL_CELL_ADHESION_MEDIATED_BY_INTEGRIN",gs_name)) |> 
+    pull(gene_symbol),
+  "Antigen Receptor Mediated Signaling"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_ANTIGEN_RECEPTOR_MEDIATED_SIGNALING_PATHWAY",gs_name)) |> 
+    pull(gene_symbol),
+  "Antigen Processing and Presentation via MHCII"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_ANTIGEN_PROCESSING_AND_PRESENTATION_OF_EXOGENOUS_PEPTIDE_ANTIGEN_VIA_MHC_CLASS_II",gs_name)) |> 
+    pull(gene_symbol),
+  "Oxidative Response"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_RESPONSE_TO_OXIDATIVE_STRESS",gs_name)) |> 
+    pull(gene_symbol),
+  "Endoplasmic Reticulum Stress"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_RESPONSE_TO_ENDOPLASMIC_RETICULUM_STRESS",gs_name)) |> 
+    pull(gene_symbol),
+  "Integrated Stress Response"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_INTEGRATED_STRESS_RESPONSE_SIGNALING",gs_name)) |> 
+    pull(gene_symbol),
+  "Stress Granule Assembly"=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_STRESS_GRANULE_ASSEMBLY",gs_name)) |> 
+    pull(gene_symbol)
+)
+
+# TODO:
+# cell proliferation, adhesion, type A/B interferons, antigen presentation, stress pathways (UPR, misfolded, stress)
+
+
+## ----------------------------------------------------------------------------------------------------
+cd4_se <- tidyexposomics:::.update_assay_colData(
+  fev1_fvc_expom,
+  "CD4 T cell RNA") |> 
+  (\(se){
+    assay(se,"log") <- log2(assay(se,"counts")+1);
+    se
+  })()
+
+
+cd16_se <- tidyexposomics:::.update_assay_colData(
+  fev1_fvc_expom,
+  "CD16 Monocyte RNA") |> 
+  (\(se){
+    assay(se,"log") <- log2(assay(se,"counts")+1);
+    se
+  })()
+
+
+
+cd4_pc_df <- map2_dfr(
+  focused_set, names(focused_set),
+  ~ cd4_se |> 
+    pivot_se() |>
+    filter(gene_name %in% .x) |>
+    dplyr::select(.sample, gene_name, log) |>
+    pivot_wider(names_from = gene_name,
+                values_from = log,
+                values_fn = mean) |>
+    column_to_rownames(".sample") |>
+    as.matrix() |>
+    {\(mat) {
+      if (ncol(mat) < 2) return(NULL)
+      tibble(
+        .sample = rownames(mat),
+        cd4_pc1 = prcomp(mat, center = TRUE, scale. = TRUE)$x[, 1],
+        set = .y
+      )
+    }}()
+) 
+
+cd16_pc_df <- map2_dfr(
+  focused_set, names(focused_set),
+  ~ cd16_se |> 
+    pivot_se() |>
+    filter(gene_name %in% .x) |>
+    dplyr::select(.sample, gene_name, log) |>
+    pivot_wider(names_from = gene_name,
+                values_from = log,
+                values_fn = mean) |>
+    column_to_rownames(".sample") |>
+    as.matrix() |>
+    {\(mat) {
+      if (ncol(mat) < 2) return(NULL)
+      tibble(
+        .sample = rownames(mat),
+        cd16_pc1 = prcomp(mat, center = TRUE, scale. = TRUE)$x[, 1],
+        set = .y
+      )
+    }}()
+) 
+
+pc_df <- inner_join(
+  cd4_pc_df,
+  cd16_pc_df,
+  by = c(".sample"=".sample","set"="set")
+) |>
+  left_join(
+    cd4_se |>
+      pivot_sample(),
+    by = ".sample"
+  ) 
+
+
+## ----------------------------------------------------------------------------------------------------
+library(GSVA)
+cd4_mat <- cd4_se |>
+  pivot_se() |>
+  dplyr::select(.sample, gene_name, log) |>
+  pivot_wider(
+    names_from  = gene_name,
+    values_from = log,
+    values_fn   = mean
+  ) |>
+  column_to_rownames(".sample") |>
+  as.matrix()
+
+cd16_mat <- cd16_se |>
+  pivot_se() |>
+  dplyr::select(.sample, gene_name, log) |>
+  pivot_wider(
+    names_from  = gene_name,
+    values_from = log,
+    values_fn   = mean
+  ) |>
+  column_to_rownames(".sample") |>
+  as.matrix()
+
+cd4_gsva_par <- gsvaParam(
+  t(cd4_mat),            # matrix: samples x genes
+  focused_set,         # list of gene sets
+  #method = "ssgsea",   # or "gsva", "zscore", "plage"
+  kcdf = "Gaussian",   # use "Gaussian" for log-transformed RNA-seq data
+  absRanking = TRUE    # use original ssGSEA normalization
+)
+
+cd16_gsva_par <- gsvaParam(
+  t(cd16_mat),            # matrix: samples x genes
+  focused_set,         # list of gene sets
+  #method = "ssgsea",   # or "gsva", "zscore", "plage"
+  kcdf = "Gaussian",   # use "Gaussian" for log-transformed RNA-seq data
+  absRanking = TRUE    # use original ssGSEA normalization
+)
+
+cd4_gsva_df <- gsva(cd4_gsva_par) |> 
+  t() |> 
+  as.data.frame() |> 
+  rownames_to_column(".sample") |> 
+  left_join(
+    cd4_se |>
+      pivot_sample(),
+    by = ".sample"
+  ) 
+
+cd16_gsva_df <- gsva(cd16_gsva_par) |> 
+  t() |> 
+  as.data.frame() |> 
+  rownames_to_column(".sample") |> 
+  left_join(
+    cd16_se |>
+      pivot_sample(),
+    by = ".sample"
+  ) 
+
+
+
+## ----------------------------------------------------------------------------------------------------
+cd4_gsva_res <- map(names(focused_set),~{
+  fit <- glm(
+    as.formula(paste("pftfev1fvc_actual~ `",.x, "`+ gli_age + gli_sex + gli_height + fis",sep = "")), data = cd4_gsva_df)
+  tidy(fit) 
+  # filter(term==paste("`",.x,"`",sep = ""))
+}) |> 
+  bind_rows() |> 
+  mutate(cell="CD4",
+         term=gsub("`","",term))
+
+cd16_gsva_res <- map(names(focused_set),~{
+  fit <- glm(
+    as.formula(paste("pftfev1fvc_actual~ `",.x, "`+ gli_age + gli_sex + gli_height + fis",sep = "")), data = cd16_gsva_df)
+  tidy(fit) 
+  #filter(term==paste("`",.x,"`",sep = ""))
+}) |> 
+  bind_rows() |> 
+  mutate(cell="CD16",
+         term=gsub("`","",term)) 
+
+gsva_res <- bind_rows(
+  cd4_gsva_res,
+  cd16_gsva_res
+)
+
+
+## ----------------------------------------------------------------------------------------------------
+# For each set: avg_vst ~ DHT + (1 | cell_line)
+cd4_pc_res <- pc_df |>
+  group_by(set) |>
+  group_modify(~{
+    fit <- glm(pftfev1fvc_actual~ cd4_pc1 + gli_age + gli_sex + gli_height + fis, data = .x)
+    tidy(fit) 
+  }) |>
+  ungroup() |> 
+  filter(term=="cd4_pc1")
+
+cd16_pc_res <- pc_df |>
+  group_by(set) |>
+  group_modify(~{
+    fit <- glm(pftfev1fvc_actual ~ cd16_pc1 + gli_age + gli_sex + gli_height + fis, data = .x)
+    tidy(fit) 
+  }) |>
+  ungroup() |> 
+  filter(term=="cd16_pc1")
+
+module_res <- bind_rows(cd4_pc_res,cd16_pc_res)
+
+
+## ----------------------------------------------------------------------------------------------------
+library(GSVA)
+cd4_se <- tidyexposomics:::.update_assay_colData(
+  fev1_fvc_expom,
+  "CD4 T cell RNA") |> 
+  (\(se){
+    assay(se,"log") <- log2(assay(se,"counts")+1);
+    se
+  })()
+
+
+cd16_se <- tidyexposomics:::.update_assay_colData(
+  fev1_fvc_expom,
+  "CD16 Monocyte RNA") |> 
+  (\(se){
+    assay(se,"log") <- log2(assay(se,"counts")+1);
+    se
+  })()
+
+cd4_mat <- cd4_se |>
+  pivot_se() |>
+  dplyr::select(.sample, gene_name, log) |>
+  pivot_wider(
+    names_from  = gene_name,
+    values_from = log,
+    values_fn   = mean
+  ) |>
+  column_to_rownames(".sample") |>
+  as.matrix()
+
+cd16_mat <- cd16_se |>
+  pivot_se() |>
+  dplyr::select(.sample, gene_name, log) |>
+  pivot_wider(
+    names_from  = gene_name,
+    values_from = log,
+    values_fn   = mean
+  ) |>
+  column_to_rownames(".sample") |>
+  as.matrix()
+
+go_df <- msigdbr::msigdbr(
+  species = "Homo sapiens",
+  category = "C5") |> 
+  filter(grepl("ANTIGEN|ADHESION|INTERFERON|STRESS|UNFOLDED|PROLIFERATION|CELL_CYCLE|CELL_DIVISION|DNA_DAMAGE|INTERLEUKIN|CYTOKINE|CHEMOKINE|MITOCHONDRIA|OXIDATIVE|ATP|APOPTOSIS|CELL_DEATH",gs_name)) |> 
+  filter(grepl("^GO",gs_name))
+
+focused_set <- map(unique(go_df$gs_name),
+                   ~{go_df |> 
+                       filter(gs_name %in% .x) |>
+                       pull(gene_symbol)}) |>
+  set_names(unique(go_df$gs_name))
+
+# focused_set <- map(unique(enr_res_sig$parentTerm),
+#                    ~{
+#                      enr_res_sig |> 
+#                        filter(parentTerm==.x) |> 
+#                        separate_rows(sep=", ",ids) |> 
+#                        pull(ids) |> 
+#                        unique()
+#                    }) |>
+#   set_names(unique(enr_res_sig$parentTerm))
+
+
+
+focused_set <- focused_set[lengths(focused_set)>20]
+
+
+cd4_gsva_par <- gsvaParam(
+  t(cd4_mat),            # matrix: samples x genes
+  focused_set,         # list of gene sets
+  kcdf = "Gaussian",   # use "Gaussian" for log-transformed RNA-seq data
+  absRanking = TRUE    # use original ssGSEA normalization
+)
+
+cd16_gsva_par <- gsvaParam(
+  t(cd16_mat),            # matrix: samples x genes
+  focused_set,         # list of gene sets
+  kcdf = "Gaussian",   # use "Gaussian" for log-transformed RNA-seq data
+  absRanking = TRUE    # use original ssGSEA normalization
+)
+
+cd4_gsva_df <- gsva(cd4_gsva_par) |> 
+  t() |> 
+  as.data.frame() |> 
+  rownames_to_column(".sample") |> 
+  left_join(
+    cd4_se |>
+      tidybulk::pivot_sample(),
+    by = ".sample"
+  ) 
+
+cd16_gsva_df <- gsva(cd16_gsva_par) |> 
+  t() |> 
+  as.data.frame() |> 
+  rownames_to_column(".sample") |> 
+  left_join(
+    cd16_se |>
+      tidybulk::pivot_sample(),
+    by = ".sample"
+  ) 
+
+cd4_gsva_res <- map(names(focused_set),~{
+  fit <- glm(
+    as.formula(paste("pftfev1fvc_actual~ `",.x, "`+ gli_age + gli_sex + gli_height + fis",sep = "")), data = cd4_gsva_df)
+  tidy(fit) |> 
+    filter(grepl("GO",term))
+}) |> 
+  bind_rows() |> 
+  mutate(cell="CD4",
+         term=gsub("`","",term))
+
+cd16_gsva_res <- map(names(focused_set),~{
+  fit <- glm(
+    as.formula(paste("pftfev1fvc_actual~ `",.x, "`+ gli_age + gli_sex + gli_height + fis",sep = "")), data = cd16_gsva_df)
+  tidy(fit)  |> 
+    filter(grepl("GO",term))
+}) |> 
+  bind_rows() |> 
+  mutate(cell="CD16",
+         term=gsub("`","",term)) 
+
+gsva_res <- bind_rows(
+  cd4_gsva_res,
+  cd16_gsva_res
+) |> 
+  mutate(category = case_when(
+    grepl("ANTIGEN", term) ~ "Antigen Presentation",
+    grepl("ADHESION", term) ~ "Cell Adhesion",
+    grepl("INTERLEUKIN|CYTOKINE|CHEMOKINE", term) ~ "Cytokine Signaling",
+    grepl("INTERFERON", term) ~ "Interferon Response",
+    grepl("PROLIFERATION|CELL_CYCLE|CELL_DIVISION", term) ~ "Proliferation",
+    grepl("DNA_DAMAGE", term) ~ "DNA Damage Response",
+    grepl("STRESS|UNFOLDED", term) ~ "ER/Stress Response",
+    grepl("MITOCHONDRIA|OXIDATIVE|ATP", term) ~ "Mitochondrial Metabolism",
+    grepl("APOPTOSIS|CELL_DEATH", term) ~ "Apoptosis",
+    TRUE ~ "Other"
+  ))
+
+# mutate(category = case_when(
+#   str_detect(term, regex("ANTIGEN", ignore_case = TRUE))      ~ "Antigen Presentation",
+#   str_detect(term, regex("ADHESION", ignore_case = TRUE))     ~ "Cell Adhesion",
+#   str_detect(term, regex("INTERFERON", ignore_case = TRUE))   ~ "Interferon Response",
+#   str_detect(term, regex("STRESS|UNFOLDED", ignore_case = TRUE)) ~ "Stress Response",
+#   str_detect(term, regex("PROLIFERATION", ignore_case = TRUE))~ "Proliferation",
+#   str_detect(term, regex("DNA_DAMAGE", ignore_case = TRUE))   ~ "DNA Damage",
+#   str_detect(term, regex("INTERLEUKIN", ignore_case = TRUE))  ~ "Interleukin Signaling",
+#   str_detect(term, regex("CYTOKINE", ignore_case = TRUE))     ~ "Cytokine Signaling",
+#   str_detect(term, regex("CHEMOKINE", ignore_case = TRUE))    ~ "Chemokine Signaling",
+#   TRUE ~ "Other"
+# ))
+
+
+## ----------------------------------------------------------------------------------------------------
+gsva_res |>
+  group_by(cell, category) |>
+  summarize(
+    median_est = median(estimate),
+    median_logp = median(-log10(p.value)),
+    n_terms = n(),
+    .groups = "drop"
+  ) |>
+  ggplot(aes(
+    x = cell,
+    y = fct_reorder2(category, cell,median_est),
+    fill = median_est
+  )) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#5399b0",
+    mid = "grey85",
+    high = "#9B6981FF",
+    midpoint = 0,
+    name = "Median Estimate"
+  ) +
+  theme_bw() +
+  labs(
+    x = "",
+    y = ""
+  ) +
+  scale_x_discrete(labels=c(
+    "CD4"       = expression(CD4^"+" ~ "T cell"),
+    "CD16"       = expression(CD16^"+" ~ "Monocyte")))+
+  theme(
+    axis.text.y = element_text(size = 10),
+    axis.text.x = element_text(size = 10, angle = 90, hjust = 1,vjust=.35),
+    panel.grid = element_blank()
+  )
+
+
+## ----------------------------------------------------------------------------------------------------
+# Assume this gives: .sample, Th1, Th2, Treg, etc.
+th_profiles <- decon |> 
+  tidybulk::pivot_sample() |>
+  dplyr::select(.sample, contains("cell"), contains("T.reg"))
+
+# Join with GSVA scores
+cd4_merged <- cd4_gsva_df |> dplyr::select(starts_with("GO"),.sample) |> 
+  inner_join(th_profiles, by = ".sample")
+
+# Get list of GSVA terms and Th features
+gsva_cols <- cd4_gsva_df |> 
+  dplyr::select(starts_with("GO"),.sample) |> 
+  colnames() |> 
+  setdiff(".sample")
+th_cols   <- th_profiles |>
+  colnames() |> 
+  setdiff(".sample")
+
+# Correlation per GSVA × Th combination
+library(purrr)
+
+gsva_cor_res <- crossing(gsva = gsva_cols, th = th_cols) |>
+  mutate(
+    cor = map2_dbl(gsva,
+                   th, ~ cor(cd4_merged[[.x]],
+                             cd4_merged[[.y]],
+                             method = "spearman")),
+    pval = map2_dbl(gsva,
+                    th, ~ cor.test(cd4_merged[[.x]], 
+                                   cd4_merged[[.y]],
+                                   method = "spearman")$p.value)
+  ) |>
+  mutate(padj = p.adjust(pval, method = "fdr")) |> 
+  mutate(th=gsub("\\."," ",th)) |> 
+  mutate(category = case_when(
+    grepl("ANTIGEN", gsva) ~ "Antigen Presentation",
+    grepl("ADHESION", gsva) ~ "Cell Adhesion",
+    grepl("INTERLEUKIN|CYTOKINE|CHEMOKINE", gsva) ~ "Cytokine Signaling",
+    grepl("INTERFERON", gsva) ~ "Interferon Response",
+    grepl("PROLIFERATION|CELL_CYCLE|CELL_DIVISION", gsva) ~ "Proliferation",
+    grepl("DNA_DAMAGE", gsva) ~ "DNA Damage Response",
+    grepl("STRESS|UNFOLDED", gsva) ~ "ER/Stress Response",
+    grepl("MITOCHONDRIA|OXIDATIVE|ATP", gsva) ~ "Mitochondrial Metabolism",
+    grepl("APOPTOSIS|CELL_DEATH", gsva) ~ "Apoptosis",
+    TRUE ~ "Other"
+  ))
+
+
+## ----------------------------------------------------------------------------------------------------
+gsva_cor_res |> 
+  mutate(combo=paste(th,category)) |> 
+  group_by(combo) |> 
+  reframe(med_cor=median(cor),th,category) |>
+  distinct() |> 
+  arrange(med_cor) |> 
+  dplyr::select(th,category,med_cor) |> 
+  tidygraph::as_tbl_graph() |> 
+  ggraph::ggraph(
+    layout = "linear",
+    circular = TRUE
+  ) +
+  ggraph::geom_edge_arc(aes(
+    color = med_cor,
+    width = abs(med_cor)*20
+  )) +
+  ggraph::geom_node_point(shape = 21,
+                          size = 4,
+                          alpha = 0.8
+  ) +
+  ggraph::geom_node_text(
+    aes(
+      label = stringr::str_wrap(name, width = 15),
+      x = 1.1 * x,
+      y = 1.1 * y,
+      angle = ggraph::node_angle(x, y)
+    ),
+    hjust = "outward",
+    fontface = "bold.italic",
+    lineheight = 0.9,
+    check_overlap = TRUE
+  ) +
+  ggraph::theme_graph() +
+  ggraph::scale_edge_color_gradient2(
+    high = "#C33764",
+    mid = "white",
+    low = "#1D2671",
+    midpoint = 0,
+    guide = ggraph::guide_edge_colorbar()
+  ) +
+  ggplot2::coord_fixed(xlim = c(-2, 2), ylim = c(-2, 2)) +
+  ggplot2::guides(edge_width = "none") +
+  ggplot2::labs(
+    edge_color = "Median Correlation"
+  )+
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal")
+
+
+## ----------------------------------------------------------------------------------------------------
+
+
+
+## ----------------------------------------------------------------------------------------------------
+library(msigdbr)
+
+msig_c7 <- msigdbr(
+  species = "Homo sapiens",
+  category = "C7"
+)
+
+th2_genes <- msig_c7 |> 
+  filter(grepl("TH2_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+th1_genes <- msig_c7 |> 
+  filter(grepl("TH1_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+tfh_genes <- msig_c7 |> 
+  filter(grepl("TFH_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+
+th17_genes <- msig_c7 |> 
+  filter(grepl("TH17_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+treg_genes <- msig_c7 |> 
+  filter(grepl("NATURAL_TREG_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+
+immune_genes <- list(
+  Th1 = th1_genes,
+  Th2 = th2_genes,
+  Th17 = th17_genes,
+  Treg = treg_genes,
+  Tfh = tfh_genes
+)
+
+path_df <- map2_dfr(
+  immune_genes, names(immune_genes),
+  ~ cd4_se |> 
+    pivot_se() |>
+    filter(gene_name %in% .x) |>
+    dplyr::select(.sample, gene_name, log) |>
+    pivot_wider(names_from = gene_name,
+                values_from = log,
+                values_fn = mean) |>
+    column_to_rownames(".sample") |>
+    as.matrix() |>
+    {\(mat) {
+      if (ncol(mat) < 2) return(NULL)
+      tibble(
+        .sample = rownames(mat),
+        pc1 = prcomp(mat, center = TRUE, scale. = TRUE)$x[, 1],
+        set = .y
+      )
+    }}()
+) |>
+  left_join(
+    cd4_se |>
+      pivot_sample(),
+    by = ".sample"
+  ) 
+
+# For each set: avg_vst ~ DHT + (1 | cell_line)
+th_res <- path_df |>
+  group_by(set) |>
+  group_modify(~{
+    fit <- glm(pc1 ~ pftfev1fvc_actual + gli_age + gli_sex + gli_height + fis, data = .x)
+    tidy(fit) 
+  }) |>
+  ungroup()
+
+
+## ----------------------------------------------------------------------------------------------------
+
+
+th1_genes <- c(
+  "TBX21", "IFNG", "STAT1", "STAT4", "IL12RB1", "IL12RB2",
+  "CXCR3", "CCR5"
+)
+
+th2_genes <- c(
+  "GATA3", "IL4", "IL5", "IL13", "STAT6",
+  "CCR4", "CCR8", "IL1RL1"
+)
+
+th17_genes <- c(
+  "RORC", "IL17A", "IL17F", "IL22",
+  "STAT3", "IL23R", "CCR6"
+)
+
+treg_genes <- c(
+  "FOXP3", "IL2RA", "CTLA4",
+  "IKZF2", "TGFB1", "IL10"
+)
+
+tfh_genes <- c(
+  "BCL6", "CXCR5", "PDCD1",
+  "ICOS", "IL21", "SH2D1A",
+  "TNFSF13B","TNFSF13"
+)
+
+type2_cytokines <- c(
+  "IL4", "IL5", "IL13", "IL9",
+  "CCL17", "CCL22", "IL1RL1"
+)
+
+type1_ifn_genes <- c(
+  "IFNG", "TNF", "IL2",
+  "STAT1", "IRF1", "CXCL9", "CXCL10"
+)
+
+il17_axis_genes <- c(
+  "IL17A", "IL17F", "IL22",
+  "CXCL8", "CSF3", "S100A8", "S100A9"
+)
+
+monocyte_effector_genes <- c(
+  "IL6", "TNF", "IL1B",
+  "CCL2", "CCL3", "CCL4",
+  "NFKBIA"
+)
+
+exhaustion_genes <- c(
+  "PDCD1", "CTLA4", "LAG3", "HAVCR2", "TIGIT",
+  "TOX", "NR4A1", "NR4A2", "NR4A3",
+  "BATF"
+)
+
+chronic_activation_genes <- c(
+  "HIF1A", "DDIT3", "XBP1",
+  "ATF4", "JUN", "FOS",
+  "GADD45A"
+)
+
+library(msigdbr)
+
+msig_c7 <- msigdbr(
+  species = "Homo sapiens",
+  category = "C7"
+)
+
+th2_genes <- msig_c7 |> 
+  filter(grepl("TH2_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+th1_genes <- msig_c7 |> 
+  filter(grepl("TH1_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+tfh_genes <- msig_c7 |> 
+  filter(grepl("TFH_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+
+th17_genes <- msig_c7 |> 
+  filter(grepl("TH17_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+treg_genes <- msig_c7 |> 
+  filter(grepl("NATURAL_TREG_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+
+immune_genes <- list(
+  Th1 = th1_genes,
+  Th2 = th2_genes,
+  Th17 = th17_genes,
+  Treg = treg_genes,
+  Tfh = tfh_genes,
+  #Type2_Cytokines = type2_cytokines,
+  Type1_IFN = type1_ifn_genes,
+  IL17_Axis = il17_axis_genes,
+  Monocyte_Effector = monocyte_effector_genes,
+  Exhaustion = exhaustion_genes,
+  Chronic_Activation = chronic_activation_genes
+) |> 
+  purrr::imap_dfr(~ tibble(
+    group = .y,
+    gene  = .x
+  )) |> 
+  left_join(
+    fev1_fvc_expom@metadata |> 
+      pluck("differential_analysis",
+            "differential_abundance") |>
+      filter(exp_name %in% c(
+        "CD4 T cell RNA",
+        "CD16 Monocyte RNA")),
+    by=c("gene"="feature_map"),
+    relationship = "many-to-many"
+  )
+
+
+## ----------------------------------------------------------------------------------------------------
+library(msigdbr)
+
+msig_c7 <- msigdbr(
+  species = "Homo sapiens",
+  category = "C7"
+)
+
+th2_genes <- msig_c7 |> 
+  filter(grepl("TH2_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+th1_genes <- msig_c7 |> 
+  filter(grepl("TH1_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+tfh_genes <- msig_c7 |> 
+  filter(grepl("TFH_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+
+th17_genes <- msig_c7 |> 
+  filter(grepl("TH17_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+treg_genes <- msig_c7 |> 
+  filter(grepl("NATURAL_TREG_UP",gs_name)) |> 
+  pull(gene_symbol)
+
+
+immune_genes <- list(
+  Th1 = th1_genes,
+  Th2 = th2_genes,
+  Th17 = th17_genes,
+  Treg = treg_genes,
+  Tfh = tfh_genes
+)|> 
+  purrr::imap_dfr(~ tibble(
+    group = .y,
+    gene  = .x
+  )) |> 
+  left_join(
+    fev1_fvc_expom@metadata |> 
+      pluck("differential_analysis",
+            "differential_abundance") |>
+      filter(exp_name %in% c(
+        "CD4 T cell RNA",
+        "CD16 Monocyte RNA")),
+    by=c("gene"="feature_map"),
+    relationship = "many-to-many"
+  )
+
+
+## ----------------------------------------------------------------------------------------------------
+immune_genes |>
+  filter(!is.na(gene_name),
+         !(grepl("Th",group) & grepl("CD16",exp_name)),
+         !(grepl("Monocyte",group) & grepl("CD4",exp_name)),
+         grepl("CD4",exp_name)
+  ) |> 
+  mutate(
+    neglogp = -log10(P.Value),
+    gene_label = reorder_within(gene_name, logFC, exp_name),
+    exp_name = fct_reorder(exp_name, logFC, median, .desc = TRUE)
+  ) |>
+  ggplot(aes(
+    x = logFC,
+    y = gene_label,
+    color = logFC,
+    size = neglogp
+  )) +
+  geom_point(alpha = 0.8) +
+  facet_grid(group ~ exp_name, scales = "free", space = "free") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  tidytext::scale_y_reordered() +
+  theme_bw() +
+  theme(strip.text.y = element_text(angle = 0,
+                                    face="bold.italic"),
+        strip.text.x = element_text(face="bold.italic"),
+        axis.text.y = element_text(face = "italic")) +
+  scale_color_gradient2(
+    low = "#5399b0",
+    mid = "grey85",
+    high = "#9B6981FF",
+    midpoint = 0
+  ) +
+  labs(
+    x = "Effect size (logFC)",
+    y = NULL,
+    color = expression("Log"[2] * "FC"),
+    size = expression("-Log"[10] * "P")
+  )
+
+
+
+## ----------------------------------------------------------------------------------------------------
+immune_genes |>
+  filter(!is.na(gene_name),
+         !(grepl("Th|Treg|IL17|Tfh",group) & grepl("CD16",exp_name)),
+         !(grepl("Monocyte",group) & grepl("CD4",exp_name)),
+         grepl("CD16",exp_name)
+  ) |> 
+  mutate(
+    neglogp = -log10(P.Value),
+    gene_label = reorder_within(gene_name, logFC, exp_name),
+    exp_name = fct_reorder(exp_name, logFC, median, .desc = TRUE)
+  ) |>
+  ggplot(aes(
+    x = logFC,
+    y = gene_label,
+    color = logFC,
+    size = neglogp
+  )) +
+  geom_point(alpha = 0.8) +
+  facet_grid(group ~ exp_name, scales = "free", space = "free") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  tidytext::scale_y_reordered() +
+  theme_bw() +
+  theme(strip.text.y = element_text(angle = 0,
+                                    face="bold.italic"),
+        strip.text.x = element_text(face="bold.italic"),
+        axis.text.y = element_text(face = "italic")) +
+  scale_color_gradient2(
+    low = "#5399b0",
+    mid = "grey85",
+    high = "#9B6981FF",
+    midpoint = 0
+  ) +
+  labs(
+    x = "Effect size (logFC)",
+    y = NULL,
+    color = expression("Log"[2] * "FC"),
+    size = expression("-Log"[10] * "P")
+  )
+
+
+
+## ----------------------------------------------------------------------------------------------------
+
+msig_c5 <- msigdbr(
+  species = "Homo sapiens",
+  category = "C5"
+) |> 
+  filter(grepl("CHEMOTAXIS",gs_name))
+
+x <- list(
+  
+  monocyte=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_MONOCYTE_CHEMOTAXIS",gs_name)) |> 
+    pull(gene_symbol),
+  
+  tcell=msigdbr(
+    species = "Homo sapiens",
+    category = "C5") |> 
+    filter(grepl("GOBP_T_CELL_CHEMOTAXIS",gs_name)) |> 
+    pull(gene_symbol)
+  
+)|> 
+  purrr::imap_dfr(~ tibble(
+    group = .y,
+    gene  = .x
+  )) |> 
+  left_join(
+    fev1_fvc_expom@metadata |> 
+      pluck("differential_analysis",
+            "differential_abundance") |>
+      filter(exp_name %in% c(
+        "CD4 T cell RNA",
+        "CD16 Monocyte RNA")),
+    by=c("gene"="feature_map"),
+    relationship = "many-to-many"
+  )
+
+immune_genes |> 
+  filter(!is.na(gene_name)) |> 
+  ggplot(aes(
+    x = logFC,
+    y = group,
+    fill = exp_name,
+    color = exp_name
+  )) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  #geom_jitter(height = 0.15, alpha = 0.2) +
+  scale_fill_manual(values=c(
+    "#6190E8","#3f2b96"
+  ))+
+  scale_color_manual(values=c(
+    "#6190E8","#3f2b96"
+  ))+
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_bw()+
+  theme(legend.position = "bottom",
+        legend.direction = "vertical")+
+  labs(
+    y = NULL,
+    fill = "",
+    color= "",
+    x = expression("Log"[2] * "FC")
+  )
+
+
+
+## ----------------------------------------------------------------------------------------------------
+th_tf_df <- fev1_fvc_expom |> tidyexposomics:::.update_assay_colData("CD4 T cell RNA") |>
+  pivot_se() |> 
+  filter(feature_map %in%
+           c("TBX21","GATA3","RORC","FOXP3")) 
+
+th_tf_df |> 
+  mutate(fev1fvc_category=factor(
+    fev1fvc_category,
+    
+  ))
+ggplot(aes(
+  x=fev1fvc_category,
+  y=log2(counts +1),
+  fill=fev1fvc_category
+))+
+  geom_boxplot()+
+  theme_bw()+
+  scale_fill_manual(values = c(
+    "#C33764",
+    "#654ea3",
+    "#24243e"
+  ))+
+  facet_grid(~ feature_map)+
+  geom_pwc()+
+  labs(
+    x="",
+    y=expression("Log"[2]*" (Exp + 1)")
+  )+
+  rotate_x_text(angle=45)
+
+
+## ----------------------------------------------------------------------------------------------------
+# enr_res_rna <- map(
+#   c(deg_lst,dtu_lst) |> (\(lst)lst[grepl("RNA",names(lst))])(),
+#   ~{
+#     run_fenr(
+#       selected_genes = .x,
+#       universe_genes = rna_features,
+#       db = "GO",
+#       species = "goa_human",
+#       feature_col = "gene_symbol"
+#     )
+#   }
+# ) |> 
+#   bind_rows(.id = "group")
+
+# enr_res_iso <- map(
+#   c(deg_lst,dtu_lst) |> (\(lst)lst[grepl("Isoform",names(lst))])(),
+#   ~{
+#     run_fenr(
+#       selected_genes = .x,
+#       universe_genes = isoform_features,
+#       db = "GO",
+#       species = "goa_human",
+#       feature_col = "gene_symbol"
+#     )
+#   }
+# ) |> 
+#   bind_rows(.id = "group")
+
+
+
+# cd4_ref <- read.csv("./data/cd4_ref.csv")
+# 
+# cd4_ref_meta <- cd4_ref |> 
+#   dplyr::select("specimen.specimenGuid",
+#                 "subject.ageAtFirstDraw",
+#                 "cell_type",
+#                 "sex",
+#                 "subject.ethnicity" ) |> 
+#   mutate(combo=paste(specimen.specimenGuid,
+#                      cell_type)) |> 
+#   distinct() |> 
+#   (\(df){
+#     rownames(df) = df$combo
+#     df
+#   })()
+# 
+# cd4_ref_counts <- cd4_ref |> 
+#   mutate(combo=paste(specimen.specimenGuid,
+#                      cell_type)) |> 
+#   dplyr::select(-c("specimen.specimenGuid",
+#                 "subject.ageAtFirstDraw",
+#                 "cell_type.1",
+#                 "cell_type",
+#                 "sex",
+#                 "subject.ethnicity") ) |> 
+#   column_to_rownames("combo") |> 
+#   t()
+# 
+# identical(rownames(cd4_ref_meta),colnames(cd4_ref_counts))
+# 
+# cd4_ref_se <- SummarizedExperiment(
+#   assays = SimpleList(counts=cd4_ref_counts),
+#   colData = DataFrame(cd4_ref_meta)
+# )
+# 
+# cd4_ref_se <- cd4_ref_se |> 
+#   adjust_abundance(.factor_unwanted = sex,
+#                    .factor_of_interest =  cell_type) |> 
+#   adjust_abundance(.factor_unwanted = subject.ageAtFirstDraw,
+#                    .factor_of_interest =  cell_type) |> 
+#   adjust_abundance(.factor_unwanted = specimen.specimenGuid,
+#                    .factor_of_interest =  cell_type)
+# 
+# library(Matrix)
+# 
+# expr <- cd4_ref_se@assays@data@listData[["counts_adjusted"]]
+# 
+# cell_types <- colData(cd4_ref_se)$cell_type
+# 
+# cell_by_gene <- rowsum(
+#   t(expr),
+#   group = cell_types
+# ) / as.vector(table(cell_types))
+# 
+# cell_by_gene <- t(cell_by_gene)
+# 
+# library(immunedeconv)
+# 
+# cd4_se <- tidyexposomics:::.update_assay_colData(
+#   fev1_fvc_expom,
+#   "CD4 T cell RNA") |> 
+#   (\(se){
+#     assay(se,"log") <- log2(assay(se,"counts")+1);
+#     se
+#   })() |> 
+#   deconvolve_cellularity(
+#     .abundance = "log",
+#     method="cibersort",
+#     reference = cell_by_gene[,c(
+#   "CD4-positive, alpha-beta memory T cell",
+#   "central memory CD4-positive, alpha-beta T cell",
+#   "effector memory CD4-positive, alpha-beta T cell",
+#   "naive thymus-derived CD4-positive, alpha-beta T cell",
+#   "memory regulatory T cell",
+#   "naive regulatory T cell",
+#   "memory CCR4-positive regulatory T cell"
+# )]
+#   )
+# 
+# 
+# # cd4_se <- tidyexposomics:::.update_assay_colData(
+# #   fev1_fvc_expom,
+# #   "CD4 T cell RNA") |> 
+# #   (\(se){
+# #     assay(se,"log") <- log2(assay(se,"counts")+1);
+# #     se
+# #   })() |> 
+# #   deconvolve_cellularity(
+# #     feature_column = "gene_name",
+# #     reference = get_X_cibersort() |>
+# #       dplyr::select(
+# #         all_of(
+# #           get_X_cibersort() |>
+# #             colnames() |>
+# #             (\(chr) chr[grepl("T cells CD4|T cells follicular|T cells regulatory",chr)] )())))
+# 
+# decon_res <- map(
+#   pivot_sample(decon) |> 
+#     colnames() |> 
+#     (\(chr)chr[grepl("cell|T.reg",chr)])(),
+#   ~ {glm( as.formula(paste0(
+#     "pftfev1fvc_actual ~ ",
+#     .x,
+#     " + gli_age + gli_sex + gli_height + fis")),
+#     data=pivot_sample(decon)) |>
+#       broom::tidy() |>
+#       mutate(cell=.x)}) |>
+#   bind_rows() |>
+#   filter(grepl("cell|T.reg",term))
+
+
+## ----------------------------------------------------------------------------------------------------
+# Save MultiAssayExperiment Objects
+saveRDS(fev1_fvc_expom,file="./results/deg/fev1_fvc_expom.rds")
+
+saveRDS(fev1_fvc_expom,file="./results/sens/fev1_fvc_expom.rds")
+
+# Save Enrichment Data
+saveRDS(enr_res_sig,file="./results/deg/enr_res_sig.rds")
+
+# Save Th Data
+saveRDS(gsva_assoc_res,file="./results/deg/gsva_assoc_res.rds")
+saveRDS(gsva_th_stability_res,file="./results/deg/gsva_th_stability_res.rds")
+saveRDS(gsva_th_stability_df,file="./results/deg/gsva_th_stability_df.rds")
+
+
+
+## ----------------------------------------------------------------------------------------------------
+sessionInfo()
+

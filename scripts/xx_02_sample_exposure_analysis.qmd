@@ -1086,6 +1086,7 @@ assoc_df <- expom |>
   pluck("results_df") 
   # df = n - (exposure + covars + intercept)
   # mutate(df = nrow(tidyexposomics::pivot_sample()(expom)) - 2) 
+assoc_df <- fev1_fvc_expom@metadata$association$assoc_exposures$results_df
 
 sample_size_results <- bind_rows(
   calc_sample_sizes(

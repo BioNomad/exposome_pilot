@@ -1,0 +1,766 @@
+## Load Libraries -------------------------
+
+library(tidyverse)
+library(janitor)
+library(readxl)
+library(SummarizedExperiment)
+
+source("./scripts/bin/internals.R")
+source("./scripts/bin/labels_clean.R")
+
+## Load Metadata Files ----------------------
+# cytokine levels
+aw_cytokines <- read_excel("./data/Cytokine Results Sheet_REDCAP.xlsx",sheet = "cleaned") |> 
+  mutate(sample_id=paste0("s",aw_id)) |> 
+  filter(visit_cv=="CV2") |> 
+  (\(df){
+    colnames(df) <- gsub("-| ","_",colnames(df))
+    df
+  })() |>
+  dplyr::select(dplyr::contains("conc"),
+                all_of("sample_id"))
+
+# creatine levels
+aw_creatine <- read_excel("./data/Exposome_Creatinine Request_AIRWEIGHS MEBRL ESA Results 2021_Exposome Subset.xlsx") %>% 
+  mutate(id=gsub("AW-|AW-0","",ID)) %>% 
+  dplyr::select(id,`Creatinine (mg/dL)`)|> 
+  mutate(sample_id=paste0("s",id))|> 
+  dplyr::select(-id) |> 
+  dplyr::rename("creatine"=`Creatinine (mg/dL)`) |> 
+  (\(df){df[df=="NA"]=NA;df})() |> 
+  mutate(creatine=as.numeric(creatine))
+
+# indoor pm 2.5
+aw_pm25 <- read.csv("./data/AW_PM25_2019-11-04.csv") %>% 
+  pivot_wider(names_from = "redcap_event_name",
+              values_from = "indoor_pm25_final") %>%
+  setNames(c("id",
+             "pm25_home_visit_1_arm_1",
+             "pm25_home_visit_4_arm_1")) %>% 
+  mutate(id=as.character(id)) |> 
+  mutate(sample_id=paste0("s",id))|> 
+  dplyr::select(-id)
+
+# second hand smoke
+aw_shs <- read.csv("./data/AW_SHS_2019-11-04.csv") %>%
+  pivot_wider(names_from = "redcap_event_name",
+              values_from = "indoor_airnic") %>%
+  setNames(c("id",
+             "shs_home_visit_1_arm_1",
+             "shs_home_visit_4_arm_1")) %>% 
+  mutate(id=as.character(id)) |> 
+  mutate(sample_id=paste0("s",id))|> 
+  dplyr::select(-id)
+
+# dust study
+aw_dust <- read_excel("./data/Shared AirWeighs Dust Study.xlsx") %>% 
+  .[-1,] %>% 
+  dplyr::select(colnames(.)[grepl("Record_ID|1-1",colnames(.))]) %>% 
+  mutate(across(ends_with("-1"),as.numeric))|> 
+  mutate(sample_id=paste0("s",Record_ID))|> 
+  (\(df){
+    colnames(df) <- gsub("-","_",colnames(df))
+    df
+  })() |> 
+  dplyr::select(-Record_ID) 
+
+# chemicals
+aw_chem <- read_excel("./data/AWs_Chem_copy_w_counts.xlsx") %>% 
+  .[1:195,] %>%  
+  dplyr::select(colnames(.)[grepl(
+    "\\bid\\b|\\bvisit\\b|_sg\\b|_cr\\b",colnames(.)
+  )]) %>% 
+  filter(visit==2) %>% 
+  dplyr::select(-visit) %>% 
+  mutate(across(ends_with("cr"),as.numeric)) %>% 
+  mutate(across(ends_with("sg"),as.numeric)) |> 
+  mutate(sample_id=paste0("s",id))|> 
+  dplyr::select(-id)
+
+# urine metals
+urine_metal <- read_excel("./data/Exposure final results.xlsx",
+                          sheet = "Urine") |> 
+  (\(df){df=df[-(1:2),-2];df[df=="<LOD"]=NA;df})() |> 
+  dplyr::rename(sample_id=`...1`) |> 
+  mutate(sample_id=paste0("s",gsub(".*-","",sample_id))) |> 
+  (\(df){colnames(df)=paste0("urine_",colnames(df));df})() |> 
+  dplyr::rename(sample_id=urine_sample_id) |> 
+   dplyr::mutate(across(starts_with("urine_"), as.numeric))
+
+serum_metal <- read_excel("./data/Exposure final results.xlsx",
+                          sheet = "Serum") |> 
+  (\(df){df=df[-(1:2),-2];df[df=="<LOD"]=NA;df})() |> 
+  dplyr::rename(sample_id=`...1`) |> 
+  mutate(sample_id=paste0("s",gsub(".*-","",sample_id))) |> 
+  (\(df){df=df[,-c(19:21)];df})() |> 
+  (\(df){colnames(df)=paste0("serum_",colnames(df));df})() |> 
+  dplyr::rename(sample_id=serum_sample_id) |> 
+   dplyr::mutate(across(starts_with("serum_"), as.numeric))
+
+aw_dataset_cv2 <- read_excel("./data/Exposome_aw_dataset.xlsx",sheet = "CV2")
+
+
+## Load the two Codebooks -------------------------
+aw_cb_1 <- read_csv("./data/aw_codebook_2.csv") |> 
+  filter(variable!="sample_id")
+
+aw_cb_2 <- read_excel("./data/AW_Dictionary.xlsx") |> 
+  dplyr::select(`Variable / Field Name`,
+                `Form Name`,
+                `Section Header`,
+                `Field Type`,
+                `Field Label`,
+                `Choices, Calculations, OR Slider Labels`) |> 
+  dplyr::rename(variable=`Variable / Field Name`,
+                form_name=`Form Name`,
+                section_header=`Section Header`,
+                field_type=`Field Type`,
+                field_label=`Field Label`,
+                options=`Choices, Calculations, OR Slider Labels`) |> 
+  filter(!variable %in% aw_cb_1$variable)
+
+aw_cb <- aw_cb_1 |> 
+  bind_rows(aw_cb_2) |> 
+  # fix for the cytokine data
+  bind_rows(
+    data.frame(
+      variable = colnames(aw_cytokines)[colnames(aw_cytokines) != "sample_id"],
+      form_name = "Serum Cytokines"
+    )
+  ) |> 
+  mutate(variable=gsub("-","_",variable)) |> 
+  left_join(
+    label_map,
+    by="variable"
+  )
+
+
+## Join Metadata ----------------------------
+
+# Join all meta data
+aw_meta_cv2 <- aw_dataset_cv2 |>
+  mutate(sample_id=paste0("s",id)) |> 
+  # (\(df){rownames(df)=df$sample_id;df})() |> 
+  mutate( id=as.character(id)) |> 
+  left_join(aw_cytokines,
+            by="sample_id") |> 
+  left_join(aw_creatine,
+            by="sample_id") |>  
+  left_join(aw_pm25,
+            by="sample_id") |>  
+  left_join(aw_shs,
+            by="sample_id") |>  
+  left_join(aw_dust,
+            by="sample_id") |> 
+  left_join(aw_chem,
+            by="sample_id") |> 
+  left_join(serum_metal,
+            by="sample_id") |> 
+  left_join(urine_metal,
+            by="sample_id") |> 
+  (\(df){df=df[,colnames(df) %in% c(aw_cb$variable,"sample_id")];df})() |> 
+  # filter_na_columns(., threshold = 0.2) %>% 
+  # https://www.aafp.org/pubs/afp/issues/2014/0301/p359.html
+  mutate(fev1fvc_category=case_when(
+    (pftfev1fvc_actual >= 0.75) & (pftfev1fvc_actual < 0.85) ~ "Moderate",
+    (pftfev1fvc_actual < 0.75)  ~ "Severe",
+    (pftfev1fvc_actual >= 0.85)  ~ "Normal"
+  )) |> 
+  # https://pubmed.ncbi.nlm.nih.gov/17983880/
+  mutate(ataq_category=case_when(
+    ataqscore1<1~ "Normal",
+    ataqscore1>=1 & ataqscore1 < 3  ~ "Uncontrolled_Asthma",
+    ataqscore1>=3  ~ "Very_Uncontrolled_Asthma"
+  )) |> 
+  # https://ww2.arb.ca.gov/resources/inhalable-particulate-matter-and-health
+  mutate(pm25_category=case_when(
+    pm25f<15 & !is.na(pm25f)~"Low",
+    pm25f>15 & !is.na(pm25f)~"High",
+    .default = NA
+  )) |> 
+  mutate(pm25_stages=case_when(
+    pm25f<10 & !is.na(pm25f)~"Low",
+    pm25f>10 & pm25f<25 & !is.na(pm25f) ~"Medium",
+    pm25f>25 & !is.na(pm25f)~"High",
+    .default = NA
+  )) |> 
+  mutate(pm10_category=case_when(
+    pm10f<150  & !is.na(pm10f)~"Low",
+    pm10f>150  & !is.na(pm10f)~"High",
+    .default = NA
+  )) |> 
+  # converting to meters - height is in cm
+  mutate(fev1_height=pftprefev1best/((gli_height/100)^2)) |> 
+  mutate(fev1_height_rank=percent_rank(fev1_height)) |> 
+  mutate(fev1_height_status=case_when(
+    (fev1_height_rank >= 0.60) & (fev1_height_rank < 0.79) ~ "Moderate",
+    (fev1_height_rank < 0.60)  ~ "Severe",
+    (fev1_height_rank >= 0.80)  ~ "Unobstructed"
+  )) |> 
+  (\(df){rownames(df)=df$sample_id;df})() |> 
+# standardize data for imputation:
+  # turn characters into factors
+  # logicals into factors
+  # strip empty strings to NA
+  mutate(across(where(is.character), ~ na_if(trimws(.), ""))) |>
+  mutate(across(where(is.character), as.factor)) |>
+  mutate(across(where(is.logical), ~ factor(ifelse(. %in% c(TRUE, FALSE), as.character(.), NA)))) |> 
+  column_to_rownames("sample_id") 
+
+# filter the codebook
+aw_cb <- aw_cb |> 
+  filter(variable %in% colnames(aw_meta_cv2)) |> 
+  (\(df){rownames(df)=df$variable;df})()
+
+
+## Categorize Exposures ---------------------------
+
+aw_cb <- aw_cb |> 
+  mutate(category = case_when(
+    # Indoor Air
+    variable %in% c("iv_tempavg", "pm25f", "pm10f",
+                    "ufpln", "no2f","airnicd") ~ "Indoor Air",
+    
+    # Phenols, Parabens, Antimicrobials
+    variable %in% c("x24_dcp_ug_g_cr","x25_dcp_ug_g_cr",
+                    "bpa_ug_g_cr", "bpf_ug_g_cr",
+                    "bps_ug_g_cr") ~ "Phenols",
+    variable %in% c("b_pb_ug_g_cr", "m_pb_ug_g_cr", 
+                    "p_pb_ug_g_cr", "e_pb_ug_g_cr") ~ "Parabens",
+    variable %in% c("tcc_ug_g_cr", "trcs_ug_g_cr",
+                    "bp_3_ug_g_cr") ~ "Antimicrobials",
+    
+    # Allergens
+    variable %in% c("mus_m_1_1", "Bla_g_1_1",
+                    "Fel_d_1_1", "Can_f_1_1",
+                    "Der_f_1_1") ~ "Dust Allergens",
+    
+    variable %in% c("sige_tree", "sige_grass",
+                    "sige_mold", "sige_mouse",
+                    "sige_cockroach", "sige_cat", 
+                    "sige_dog", "sige_d_pter", 
+                    "sige_d_far", "sige_ragweed") ~ "IgE Respiratory",
+    
+    variable %in% c("sige_peanut", 
+                    "sige_shrimp", "sige_egg_white",
+                    "sige_cow_milk") ~ "IgE Food",
+    
+    variable %in% c("sige_s_enter_a", 
+                    "sige_s_enter_b",
+                    "sige_s_enter_c", 
+                    "sige_s_enter_tsst") ~ "IgE Superantigen",
+    
+    variable %in% c("sige_total_ige") ~ "IgE Total",
+    
+    # Metals
+    # Serum Essential Metals
+    variable %in% c("serum_Fe", "serum_Cu", 
+                    "serum_Zn", "serum_Se", 
+                    "serum_Mn", "serum_Co",
+                    "serum_Mo") ~ "Serum Essential Metals",
+    
+    # Serum Non-essential Metals
+    variable %in% c("serum_Li", "serum_Be", "serum_Al",
+                    "serum_Cr", "serum_Ni", "serum_As",
+                    "serum_Cd", "serum_Pb", "serum_V", "serum_Sb") ~
+      "Serum Non-Essential Metals",
+
+    # Urine Essential Metals
+    variable %in% c("urine_Mn", "urine_Fe", "urine_Cu", 
+                    "urine_Zn", "urine_Se", "urine_Mo", "urine_Co") ~
+      "Urine Essential Metals",
+
+    # Urine Non-essential Metals
+    variable %in% c("urine_Li", "urine_Be", "urine_Al",
+                    "urine_V", "urine_Cr", "urine_Ni",
+                    "urine_As", "urine_Cd", "urine_Sb", "urine_Pb") ~
+      "Urine Non-Essential Metals",
+    
+    form_name == "treated" ~ "Treated",
+    form_name == "chemicals" ~ "Chemicals",
+    form_name == "second_hand_smoke" ~ "Second-Hand Smoke",
+    form_name == "randomization" ~ "Randomization",
+    form_name == "act_combined" ~ "ACT Combined",
+    form_name == "asui" ~ "ASUI",
+    form_name == "isaac_combined_b1b4" ~ "ISAAC Questionnaire",
+    form_name == "exhaled_nitric_oxide" ~ "Exhaled Nitric Oxide Questionnaire",
+    form_name == "allergen_results"~ "Allergen Comments",
+    form_name == "airweighs_sleepresultform" ~ "Sleep Study",
+    form_name == "cbcl_618_scores" ~ "Activity Score",
+    form_name == "creatine" ~ "Creatine",
+    form_name == "particulate_matter" ~ "Particulate Matter Home Visit",
+    form_name == "season" ~ "Season",
+    form_name == "fitbit_metadata" ~ "Fitbit Metadata",
+    form_name == "ataq" ~ "ATAQ Questionaire",
+    form_name == "primary_outcome" ~ "Primary Outcome Questionaire",
+    form_name == "rsui" ~ "RSUI",
+    form_name == "bmi_calculator" ~ "BMI Caclulator",
+    form_name == "spirometry" ~ "Spirometry",
+    form_name == "anthropometry" ~ "BMI Caclulator",
+    # removing previous cytokine data due to lod issues
+    # including the re-run data instead
+    form_name == "cytokines_and_other_inflammatory_markers" ~ "to_remove",
+    form_name == "elf_results_unc_lab" ~ "Nasal Cytokines",
+    
+
+    
+    .default = form_name
+    
+  )) |> 
+  filter(category != "to_remove")
+
+
+
+## Gene Expression -------------
+
+gene_counts <- read.csv("./data/salmon.merged.gene_counts.tsv",sep="\t")
+
+gene_fdata <- gene_counts |> 
+  dplyr::select(gene_id,gene_name) |> 
+  mutate(feature_id=gene_name) |> 
+  mutate(feature_map=feature_id) |>
+  (\(df){rownames(df)=df$gene_id;df})()
+
+gene_counts <- gene_counts |> 
+  column_to_rownames("gene_id") |> 
+  dplyr::select(-gene_name)
+
+cd16_gene_meta <- read_excel(
+  "./data/AIRWEIGHS_RNA Extractions_20211109.xlsx",
+  sheet = "CD16+ Non-classical ") %>% 
+  dplyr::select(`Lab ID`,`Study ID`) %>% 
+  mutate(cell_type="CD16+ Non-classical") %>% 
+  mutate(cell_simple="CD16")
+
+cd4_gene_meta <- read_excel(
+  "./data/AIRWEIGHS_RNA Extractions_20211109.xlsx",
+  sheet = "CD4+ T cells",skip = 1) %>% 
+  dplyr::select(`Lab ID`,`Study ID`)%>% 
+  mutate(cell_type="CD4+ T cells") %>% 
+  mutate(cell_simple="CD4")
+
+gene_meta <- rbind(cd16_gene_meta,cd4_gene_meta) %>% 
+  mutate(`Lab ID`=paste("S",`Lab ID`,sep="")) %>% 
+  filter(`Lab ID` %in% colnames(gene_counts)) %>% 
+  mutate(`Study ID`=as.character(`Study ID`))
+
+
+gene_meta <- left_join(
+  gene_meta,
+  aw_meta_cv2,
+  by=c("Study ID"="id")
+) %>% 
+  as.data.frame() %>% 
+  `rownames<-`(.$`Lab ID`) |> 
+  mutate(sample_id=paste0("s",`Study ID`))
+
+
+# ensure that sample order matches
+# df[match(target, df$name),]
+gene_meta <- gene_meta[match(colnames(gene_counts),rownames(gene_meta)),]
+
+
+if(isFALSE(all(colnames(gene_counts)==rownames(gene_meta)))){
+  stop("sample order does not match")
+}else{
+  message("Success! Sample order matches")
+}
+
+cd4_gene_counts <- gene_counts[,(gene_meta |> 
+                                   filter(cell_simple=="CD4") |>
+                                   rownames())] |> 
+  rownames_to_column("gene_name") |> 
+  pivot_longer(-gene_name,
+               names_to = "Lab ID",
+               values_to = "exp") |> 
+  inner_join(gene_meta |> 
+               dplyr::select(`Lab ID`,sample_id),
+             by="Lab ID") |> 
+  dplyr::select(-`Lab ID`) |> 
+  dplyr::select(gene_name,sample_id,exp) |> 
+  pivot_wider(names_from = "sample_id",
+              values_from = "exp") |> 
+  column_to_rownames("gene_name")
+
+cd16_gene_counts <- gene_counts[,(gene_meta |> 
+                                   filter(cell_simple=="CD16") |>
+                                   rownames())] |> 
+  rownames_to_column("gene_name") |> 
+  pivot_longer(-gene_name,
+               names_to = "Lab ID",
+               values_to = "exp") |> 
+  inner_join(gene_meta |> 
+               dplyr::select(`Lab ID`,sample_id),
+             by="Lab ID") |> 
+  dplyr::select(-`Lab ID`) |> 
+  dplyr::select(gene_name,sample_id,exp) |> 
+  pivot_wider(names_from = "sample_id",
+              values_from = "exp") |> 
+  column_to_rownames("gene_name")
+
+
+## Isoform Data -----------------
+
+
+# isoform counts
+isoform_counts <- read.csv("./data/salmon.merged.transcript_counts.tsv",sep="\t")
+
+isoform_fdata <- read.csv("./data/tx2gene.tsv",sep="\t") |> 
+  (\(df){rownames(df)=df$transcript_id;df})() |> 
+  mutate(feature_id=gene_name) |> 
+  mutate(feature_map=feature_id) |>
+  filter(transcript_id %in% isoform_counts$tx)
+
+  
+# ensure order matches for features
+if(isFALSE(all(isoform_counts$transcript_id==isoform_fdata$transcript_id))){
+  stop("order does not match") 
+}else{ 
+  message("Success! Order matches")
+}
+
+# make tx id the rownames
+isoform_counts <- isoform_counts %>% 
+  dplyr::select(-gene_id) %>% 
+  column_to_rownames("tx") %>% 
+  as.data.frame()
+
+# ensure that sample order matches
+# df[match(target, df$name),]
+isoform_fdata <- isoform_fdata[match(rownames(isoform_counts),rownames(isoform_fdata)),]
+
+# ensure order matches for features
+if(isFALSE(all(rownames(isoform_counts)==isoform_fdata$transcript_id))){
+    stop("order does not match") 
+}else{ 
+    message("Success! Order matches")
+}
+
+
+# ensure that sample order matches
+# df[match(target, df$name),]
+gene_meta <- gene_meta[match(colnames(isoform_counts),rownames(gene_meta)),]
+
+if(isFALSE(all(colnames(isoform_counts)==rownames(gene_meta)))){
+  stop("sample order does not match")
+}else{
+  message("Success! Sample order matches")
+}
+
+
+if(isFALSE(
+  all(colnames(isoform_counts)==rownames(gene_meta))
+  )){
+  stop("sample order does not match")
+}else{
+  message("Success! Sample order matches")
+}
+
+cd4_isoform_counts <- isoform_counts[,(gene_meta |> 
+                                   filter(cell_simple=="CD4") |>
+                                   rownames())] |> 
+  rownames_to_column("gene_name") |> 
+  pivot_longer(-gene_name,
+               names_to = "Lab ID",
+               values_to = "exp") |> 
+  inner_join(gene_meta |> 
+               dplyr::select(`Lab ID`,sample_id),
+             by="Lab ID") |> 
+  dplyr::select(-`Lab ID`) |> 
+  dplyr::select(gene_name,sample_id,exp) |> 
+  pivot_wider(names_from = "sample_id",
+              values_from = "exp") |> 
+  column_to_rownames("gene_name")
+
+cd16_isoform_counts <- isoform_counts[,(gene_meta |> 
+                                   filter(cell_simple=="CD16") |>
+                                   rownames())] |> 
+  rownames_to_column("gene_name") |> 
+  pivot_longer(-gene_name,
+               names_to = "Lab ID",
+               values_to = "exp") |> 
+  inner_join(gene_meta |> 
+               dplyr::select(`Lab ID`,sample_id),
+             by="Lab ID") |> 
+  dplyr::select(-`Lab ID`) |> 
+  dplyr::select(gene_name,sample_id,exp) |> 
+  pivot_wider(names_from = "sample_id",
+              values_from = "exp") |> 
+  column_to_rownames("gene_name")
+
+
+## Protein Abundance ---------------------------
+prot <- readxl::read_excel("./data/proteomics.xlsx")
+
+prot_fdata <- prot[,1:2] %>% 
+  as.data.frame() %>% 
+  `row.names<-`(.$Protein.Group) |> 
+  dplyr::rename(
+    "protein_id"="Protein.Group",
+    "gene_name"="Genes"
+  ) |> 
+  (\(df){rownames(df)=df$protein_id;df})() |> 
+  mutate(feature_id = gene_name ) |> 
+  mutate(feature_map=feature_id) 
+
+prot_abd <- prot %>% 
+  dplyr::select(
+  c("Protein.Group",colnames(prot)[grepl("E.._",colnames(prot))])
+) %>% 
+  column_to_rownames("Protein.Group") |> 
+  dplyr::rename()
+
+prot_abd[prot_abd=="nd"] <- NA
+
+prot_abd <- prot_abd %>% 
+  mutate(across(all_of(colnames(.)), as.numeric)) %>% 
+  dplyr::select(colnames(.)[grepl("Asth",colnames(.))]) %>% 
+  `colnames<-`(gsub("_.*","",colnames(.)))
+
+prot_meta <- read_excel("./data/Exposomics_key.xlsx") %>% 
+  filter(grepl("AW",Sample_ID)) %>% 
+  mutate(Sample_ID=gsub("AW","",Sample_ID)) %>% 
+  as.data.frame() %>% 
+  left_join(.,
+            aw_meta_cv2,
+            by=c("Sample_ID"="id")) %>% 
+  `rownames<-`(.$Inj_ID) |> 
+  mutate(sample_id=paste0("s",Sample_ID))
+
+# ensure that sample order matches
+# df[match(target, df$name),]
+prot_meta <- prot_meta[match(colnames(prot_abd),rownames(prot_meta)),]
+
+if(isFALSE(
+  all(colnames(prot_abd)==rownames(prot_meta))
+  )){
+  stop("sample order does not match")
+}else{
+  message("Success! Sample order matches")
+}
+
+prot_abd <- prot_abd |> 
+  rownames_to_column("gene_name") |> 
+  pivot_longer(-gene_name,
+               names_to = "Inj_ID",
+               values_to = "exp") |> 
+  inner_join(prot_meta |> 
+               dplyr::select(`Inj_ID`,sample_id),
+             by="Inj_ID") |> 
+  dplyr::select(-`Inj_ID`) |> 
+  dplyr::select(gene_name,sample_id,exp) |> 
+  pivot_wider(names_from = "sample_id",
+              values_from = "exp") |> 
+  column_to_rownames("gene_name")
+
+
+
+## Adductomics -------------------------
+adduct <- read_rds("./data/Adductomics/Exposome_wide_ProtNorm.rds") |> 
+  column_to_rownames("IonIntQuant_key") |> 
+  (\(df){colnames(df)=paste0("s",gsub("_.*","",colnames(df)));df})() |> 
+  (\(df){rownames(df)=gsub("\\&","_and_",rownames(df));df})()
+
+adduct_fdata <- read_rds("./data/Adductomics/Targets.rds") |> 
+  mutate(IonIntQuant_key=gsub("\\&","_and_",IonIntQuant_key)) |> 
+  mutate(feature_id = case_when(
+    !is.na(annotation) ~ paste(Gene_name,annotation,sep="-"),
+    is.na(annotation) ~ paste(Gene_name,residue,sep="-")
+  )) |> 
+  mutate(feature_map=Gene_name) |> 
+(\(df){rownames(df)=df$IonIntQuant_key;df})()
+
+human_adducts <- adduct_fdata |> 
+  filter(Species=="HUMAN") |> 
+  pull(IonIntQuant_key)
+
+adduct <- adduct[rownames(adduct) %in% human_adducts,]
+
+adduct_fdata <- adduct_fdata |> 
+  filter(Species=="HUMAN")
+
+
+## Clean up Protein/Adductomcis ------------------------------
+# Compute protein-level metadata
+protein_lengths <- adduct_fdata |>
+    group_by(Protein_ID) |>
+    summarize(protein_length = max(pep_end, na.rm = TRUE), .groups = "drop")
+
+modified_site_counts <- adduct_fdata |>
+    group_by(Protein_ID) |>
+    summarize(n_modified_sites = n_distinct(loci), .groups = "drop")
+
+# Compute protein-level adduct loads with normalization
+adduct_long <- adduct |>
+    as.data.frame() |>
+    tibble::rownames_to_column("IonIntQuant_key") |> 
+    pivot_longer(
+        -IonIntQuant_key,
+        names_to  = "sample",
+        values_to = "intensity"
+    ) |>
+    left_join(
+        adduct_fdata |> select(IonIntQuant_key, Protein_ID, Gene_name),
+        by = "IonIntQuant_key"
+    ) |>
+    filter(!is.na(Protein_ID)) |>
+    group_by(sample, Protein_ID, Gene_name) |>
+    reframe(
+        total_adduct_load = sum(intensity, na.rm = TRUE),
+        n_features        = sum(!is.na(intensity)),
+        mean_adduct_load  = mean(intensity, na.rm = TRUE),
+        load_per_feature  = total_adduct_load / n_features
+    ) |>
+    # Add normalization terms
+    left_join(protein_lengths, by = "Protein_ID") |>
+    left_join(modified_site_counts, by = "Protein_ID") |>
+    mutate(
+        load_per_aa       = total_adduct_load / protein_length,
+        load_per_mod_site = total_adduct_load / n_modified_sites
+    )
+
+adduct_load <- adduct_long |>
+  dplyr::select(Gene_name,
+                sample,
+                total_adduct_load) |>
+  pivot_wider(names_from = "sample",
+              values_from = "total_adduct_load") |>
+  column_to_rownames("Gene_name")
+
+adduct_load_fdata <- adduct_load |> 
+  rownames_to_column("feature_id") |> 
+  dplyr::select(feature_id) |> 
+  mutate(feature_name=feature_id) |> 
+  (\(df) {rownames(df) <- df$feature_id;df})()
+
+
+## miRNA data ---------------------------
+mirna <- read.csv("./results/input_data/mirna.csv") %>% 
+  column_to_rownames("X") %>% 
+  as.data.frame() %>% 
+  `colnames<-`(gsub(".*_","",colnames(.)))
+
+cd16_mirna_meta <- read_excel(
+  "./data/AIRWEIGHS_RNA Extractions_20211109.xlsx",
+  sheet = "CD16+ Non-classical ") %>% 
+  dplyr::select(`Lab ID`,`Study ID`) %>% 
+  mutate(cell_type="CD16+ Non-classical") %>% 
+  mutate(cell_simple="CD16")
+
+cd4_mirna_meta <- read_excel(
+  "./data/AIRWEIGHS_RNA Extractions_20211109.xlsx",
+  sheet = "CD4+ T cells",skip = 1) %>% 
+  dplyr::select(`Lab ID`,`Study ID`)%>% 
+  mutate(cell_type="CD4+ T cells") %>% 
+  mutate(cell_simple="CD4")
+
+mirna_meta <- rbind(cd16_mirna_meta,cd4_mirna_meta) %>% 
+  mutate(`Lab ID`=paste("S",`Lab ID`,sep="")) %>% 
+  filter(`Lab ID` %in% colnames(mirna)) %>% 
+  mutate(`Study ID`=as.character(`Study ID`))
+
+mirna_meta <- left_join(
+  mirna_meta,
+  aw_meta_cv2,
+  by=c("Study ID"="id")
+) %>% 
+  as.data.frame() %>% 
+  `rownames<-`(.$`Lab ID`) 
+
+# ensure that sample order matches
+# df[match(target, df$name),]
+mirna_meta <- mirna_meta[match(colnames(mirna),rownames(mirna_meta)),]
+
+
+mirna_fdata <- data.frame(
+  mirna_id=rownames(mirna),
+  feature_id=rownames(mirna)
+) |> 
+  mutate(feature_map=feature_id) |>
+  (\(df){rownames(df)=df$mirna_id;df})()
+  
+
+if(isFALSE(
+  all(colnames(mirna)==rownames(mirna_meta))
+  )){
+  stop("sample order does not match")
+}else{
+  message("Success! Sample order matches")
+}
+
+cd4_mirna_samples <- (gene_meta |> 
+    filter(cell_simple=="CD4") |>
+    rownames())[(gene_meta |> 
+    filter(cell_simple=="CD4") |>
+    rownames()) %in% colnames(mirna)]
+
+cd16_mirna_samples <- (gene_meta |> 
+    filter(cell_simple=="CD16") |>
+    rownames())[(gene_meta |> 
+    filter(cell_simple=="CD16") |>
+    rownames()) %in% colnames(mirna)]
+
+cd4_mirna_counts <- mirna[,cd4_mirna_samples] |> 
+  rownames_to_column("gene_name") |> 
+  pivot_longer(-gene_name,
+               names_to = "Lab ID",
+               values_to = "exp") |> 
+  inner_join(gene_meta |> 
+               dplyr::select(`Lab ID`,sample_id),
+             by="Lab ID") |> 
+  dplyr::select(-`Lab ID`) |> 
+  dplyr::select(gene_name,sample_id,exp) |> 
+  pivot_wider(names_from = "sample_id",
+              values_from = "exp") |> 
+  column_to_rownames("gene_name")
+
+cd16_mirna_counts <- mirna[,cd16_mirna_samples] |> 
+  rownames_to_column("gene_name") |> 
+  pivot_longer(-gene_name,
+               names_to = "Lab ID",
+               values_to = "exp") |> 
+  inner_join(gene_meta |> 
+               dplyr::select(`Lab ID`,sample_id),
+             by="Lab ID") |> 
+  dplyr::select(-`Lab ID`) |> 
+  dplyr::select(gene_name,sample_id,exp) |> 
+  pivot_wider(names_from = "sample_id",
+              values_from = "exp") |> 
+  column_to_rownames("gene_name")
+
+
+## Remove redundant column---------------------
+aw_meta_cv2 <- aw_meta_cv2 |> 
+  dplyr::select(-id)
+
+
+## Save Data --------------------------
+# Meta Data
+saveRDS(aw_meta_cv2,file="./results/input_data/aw_meta_cv2.rds")
+
+# Codebook
+saveRDS(aw_cb,file="./results/input_data/aw_cb.rds")
+
+# Abundance/Expression Data
+saveRDS(cd4_gene_counts,file="./results/input_data/cd4_gene_counts.rds")
+saveRDS(cd16_gene_counts,file="./results/input_data/cd16_gene_counts.rds")
+
+saveRDS(cd4_isoform_counts,file="./results/input_data/cd4_isoform_counts.rds")
+saveRDS(cd16_isoform_counts,file="./results/input_data/cd16_isoform_counts.rds")
+
+saveRDS(prot_abd,file="./results/input_data/prot_abd.rds")
+saveRDS(adduct,file="./results/input_data/adduct.rds")
+saveRDS(adduct_load,file="./results/input_data/adduct_load.rds")
+
+saveRDS(cd4_mirna_counts,file="./results/input_data/cd4_mirna_counts.rds")
+saveRDS(cd16_mirna_counts,file="./results/input_data/cd16_mirna_counts.rds")
+
+# Feature Data
+saveRDS(gene_fdata,file="./results/input_data/gene_fdata.rds")
+saveRDS(isoform_fdata,file="./results/input_data/isoform_fdata.rds")
+saveRDS(prot_fdata,file="./results/input_data/prot_fdata.rds")
+saveRDS(adduct_fdata,file="./results/input_data/adduct_fdata.rds")
+saveRDS(adduct_load_fdata,file="./results/input_data/adduct_load_fdata.rds")
+saveRDS(mirna_fdata,file="./results/input_data/mirna_fdata.rds")
+
+
